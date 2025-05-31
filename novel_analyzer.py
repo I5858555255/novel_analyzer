@@ -948,26 +948,28 @@ class MainWindow(QMainWindow):
                 f.write(f"{self.book_data.get('title', '未命名小说')} 提炼总结\n")
                 f.write("=" * 50 + "\n\n")
 
-                root = self.chapter_tree.invisibleRootItem()
-                for i in range(root.childCount()):
-                    vol = root.child(i)
-                    f.write(f"{vol.text(0)}\n") # Volume title
+                book_item = self.chapter_tree.topLevelItem(0)
+                if not book_item: return # Should be caught by export_results
+
+                for i in range(book_item.childCount()): # Iterate through volumes
+                    vol_item = book_item.child(i)
+                    f.write(f"{vol_item.text(0)}\n") # Volume title
                     f.write("-" * 40 + "\n")
 
-                    for j in range(vol.childCount()):
-                        chap = vol.child(j)
-                        if not isinstance(chap, ChapterTreeItem): continue
+                    for j in range(vol_item.childCount()): # Iterate through chapters
+                        chapter_item = vol_item.child(j)
+                        if not isinstance(chapter_item, ChapterTreeItem): continue
 
-                        title_to_write = chap.original_title if hasattr(chap, 'original_title') else chap.text(0)
+                        title_to_write = chapter_item.original_title if hasattr(chapter_item, 'original_title') else chapter_item.text(0)
 
-                        if chap.is_summarized and chap.summary:
+                        if chapter_item.is_summarized and chapter_item.summary:
                             f.write(f"【提炼总结】 {title_to_write}\n")
                             f.write("-" * 20 + "\n")
-                            f.write(f"{chap.summary}\n\n")
+                            f.write(f"{chapter_item.summary}\n\n")
                         else:
                             f.write(f"【原文】 {title_to_write}\n")
                             f.write("-" * 20 + "\n")
-                            f.write(f"{chap.content}\n\n")
+                            f.write(f"{chapter_item.content}\n\n")
                     f.write("\n") # Extra newline after each volume's content
         except IOError as e:
             QMessageBox.critical(self, "导出错误", f"写入TXT文件失败: {file_name}\n{str(e)}")
@@ -984,23 +986,25 @@ class MainWindow(QMainWindow):
                 f.write(f"**Token消耗:** 输入 {self.total_tokens[0]} | 输出 {self.total_tokens[1]}\n\n")
                 f.write("---\n\n")
 
-                root = self.chapter_tree.invisibleRootItem()
-            for i in range(root.childCount()): # Iterating through book title item's children (volumes)
-                vol = root.child(i)
-                f.write(f"## {vol.text(0)}\n\n") # Volume title
+                book_item = self.chapter_tree.topLevelItem(0)
+                if not book_item: return
 
-                for j in range(vol.childCount()): # Iterating through volume's children (chapters)
-                    chap = vol.child(j)
-                    if not isinstance(chap, ChapterTreeItem): continue
+            for i in range(book_item.childCount()): # Iterate through volumes
+                vol_item = book_item.child(i)
+                f.write(f"## {vol_item.text(0)}\n\n") # Volume title
 
-                    title_to_write = chap.original_title if hasattr(chap, 'original_title') else chap.text(0)
+                for j in range(vol_item.childCount()): # Iterate through chapters
+                    chapter_item = vol_item.child(j)
+                    if not isinstance(chapter_item, ChapterTreeItem): continue
 
-                    if chap.is_summarized and chap.summary:
+                    title_to_write = chapter_item.original_title if hasattr(chapter_item, 'original_title') else chapter_item.text(0)
+
+                    if chapter_item.is_summarized and chapter_item.summary:
                         f.write(f"### {title_to_write} (提炼后)\n\n")
-                        f.write(f"{chap.summary}\n\n")
+                        f.write(f"{chapter_item.summary}\n\n")
                     else:
                         f.write(f"### {title_to_write} (原文)\n\n")
-                        f.write(f"{chap.content}\n\n")
+                        f.write(f"{chapter_item.content}\n\n")
         except IOError as e:
             QMessageBox.critical(self, "导出错误", f"写入Markdown文件失败: {file_name}\n{str(e)}")
         except Exception as e:
@@ -1018,32 +1022,32 @@ class MainWindow(QMainWindow):
             "volumes": []
         }
 
-        root = self.chapter_tree.invisibleRootItem()
-        for i in range(root.childCount()):
-            vol = root.child(i)
+        book_item = self.chapter_tree.topLevelItem(0)
+        if not book_item: return
+
+        for i in range(book_item.childCount()): # Iterate through volumes
+            vol_item = book_item.child(i)
             volume_data = {
-                "title": vol.text(0),
+                "title": vol_item.text(0), # Use volume item's text
                 "chapters": []
             }
 
-            for j in range(vol.childCount()): # Iterating through volume's children (chapters)
-                chap = vol.child(j)
-                if not isinstance(chap, ChapterTreeItem): continue
+            for j in range(vol_item.childCount()): # Iterate through chapters
+                chapter_item = vol_item.child(j)
+                if not isinstance(chapter_item, ChapterTreeItem): continue
 
-                title_to_write = chap.original_title if hasattr(chap, 'original_title') else chap.text(0)
+                title_to_write = chapter_item.original_title if hasattr(chapter_item, 'original_title') else chapter_item.text(0)
                 content_to_export = ""
                 status = "original"
-                # Use stored word_count for original, calculate for summary
-                content_length = chap.word_count
+                content_length = chapter_item.word_count
 
-                if chap.is_summarized and chap.summary:
-                    content_to_export = chap.summary
+                if chapter_item.is_summarized and chapter_item.summary:
+                    content_to_export = chapter_item.summary
                     status = "refined"
-                    content_length = len(chap.summary)
+                    content_length = len(chapter_item.summary)
                 else:
-                    content_to_export = chap.content
-                    # status is already "original"
-                    # content_length is already chap.word_count from initialization or edit
+                    content_to_export = chapter_item.content
+                    # status and content_length already set for original
 
                 chapter_data = {
                     "title": title_to_write,
@@ -1053,8 +1057,6 @@ class MainWindow(QMainWindow):
                 }
                 volume_data["chapters"].append(chapter_data)
 
-            # Add volume_data to data if it contains any chapters.
-            # This ensures empty volumes (if such a case arises) are not added.
             if volume_data["chapters"]:
                 data["volumes"].append(volume_data)
 
