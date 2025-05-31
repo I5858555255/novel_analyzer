@@ -14,10 +14,11 @@ import requests
 
 
 class LLMProcessor:
-    def __init__(self, api_config):
+    def __init__(self, api_config, main_window): # Added main_window
         self.api_url = api_config['url']
         self.api_key = api_config['key']
         self.model = api_config['model']
+        self.main_window = main_window # Store main_window reference
         
         # 安全地初始化tiktoken编码器
         try:
@@ -141,12 +142,24 @@ class LLMProcessor:
 class ChapterTreeItem(QTreeWidgetItem):
     """自定义树节点存储章节数据"""
     def __init__(self, title, content, word_count, parent=None):
-        super().__init__(parent, [title, f"{word_count}字"])  # 正确顺序：parent 放前面
+        super().__init__(parent, [title, f"{word_count}字"])
+        self.original_title = title # Store original title
         self.content = content
         self.summary = ""
         self.word_count = word_count
         self.is_summarized = False
-        self.summary_timestamp = 0  # 新增时间戳记录
+        self.summary_timestamp = 0
+
+    def update_display_text(self):
+        """Updates the chapter title in the tree to reflect summary status."""
+        current_title = self.text(0)
+        marker = "* "
+        if self.is_summarized:
+            if not current_title.startswith(marker):
+                self.setText(0, marker + self.original_title)
+        else:
+            if current_title.startswith(marker):
+                self.setText(0, self.original_title)
 
 
 class WorkerThread(QThread):
@@ -341,8 +354,10 @@ class MainWindow(QMainWindow):
         self.load_btn.clicked.connect(self.load_novel)
         control_layout2.addWidget(self.load_btn)
 
-        self.summary_mode_btn = QPushButton("显示原文")
+        self.summary_mode_btn = QPushButton("显示原文") # Initial text: click to see original (implies summary is default)
         self.summary_mode_btn.setCheckable(True)
+        # Default state is not checked. If an item is summarized, summary is shown. Button says "Show Original".
+        # If button is clicked (becomes checked), original is shown. Button says "Show Summary".
         self.summary_mode_btn.clicked.connect(self.toggle_display_mode)
         control_layout2.addWidget(self.summary_mode_btn)
 
@@ -372,6 +387,13 @@ class MainWindow(QMainWindow):
         self.chapter_tree = QTreeWidget()
         self.chapter_tree.setHeaderLabels(["章节/卷", "字数"])
         self.chapter_tree.itemClicked.connect(self.show_content)
+
+        # Configure column resizing
+        header = self.chapter_tree.header()
+        header.setSectionResizeMode(0, header.Stretch) # Chapter/Volume Name column
+        header.setMinimumSectionSize(250) # Minimum width for chapter/volume column
+        header.setSectionResizeMode(1, header.ResizeToContents) # Word Count column
+
         splitter.addWidget(self.chapter_tree)
 
         # 内容显示区
@@ -470,10 +492,12 @@ class MainWindow(QMainWindow):
             encodings = ['utf-8', 'gbk', 'gb2312', 'utf-16']
             content = None
             
+            successful_encoding = None
             for encoding in encodings:
                 try:
                     with open(file_path, 'r', encoding=encoding) as f:
                         content = f.read()
+                    successful_encoding = encoding
                     break
                 except UnicodeDecodeError:
                     continue
@@ -483,10 +507,13 @@ class MainWindow(QMainWindow):
 
             # 智能章节分割
             chapters = self.parse_chapters(content)
-            self.build_chapter_tree(chapters)
 
             self.book_data["title"] = os.path.splitext(os.path.basename(file_path))[0]
             self.book_data["file_path"] = file_path
+            self.book_data["encoding"] = successful_encoding # Save the encoding
+
+            self.build_chapter_tree(chapters) # Build tree after book_data is set
+
             self.status_label.setText(f"已加载: {self.book_data['title']}")
 
         except Exception as e:
@@ -634,24 +661,39 @@ class MainWindow(QMainWindow):
         self.chapter_tree.expandAll()
 
     def show_content(self, item):
-        """显示选中章节内容"""
-        if isinstance(item, ChapterTreeItem):
-            if self.summary_mode_btn.isChecked() and item.is_summarized:
-                self.content_display.setText(item.summary)
-            else:
+        """显示选中章节内容. Shows summary by default if available."""
+        if not isinstance(item, ChapterTreeItem):
+            self.content_display.clear()
+            self.summary_mode_btn.setEnabled(False) # Disable button if no valid item selected
+            self.summary_mode_btn.setText("显示原文") # Reset text
+            return
+
+        if item.is_summarized:
+            self.summary_mode_btn.setEnabled(True)
+            if self.summary_mode_btn.isChecked(): # User explicitly wants to see original
                 self.content_display.setText(item.content)
+                self.summary_mode_btn.setText("显示要点") # Next click will show summary
+            else: # Default for summarized items: show summary
+                self.content_display.setText(item.summary)
+                self.summary_mode_btn.setText("显示原文") # Next click will show original
+        else: # Not summarized, always show original content
+            self.content_display.setText(item.content)
+            self.summary_mode_btn.setText("显示要点") # Next click would show summary (but no summary exists)
+            self.summary_mode_btn.setEnabled(False) # Disable button if no summary to toggle to
 
     def toggle_display_mode(self):
-        """切换原文/要点显示模式"""
-        if self.summary_mode_btn.isChecked():
-            self.summary_mode_btn.setText("显示要点")
-        else:
-            self.summary_mode_btn.setText("显示原文")
-        
-        # 刷新当前显示
+        """切换显示模式 (原文/提炼后). Called AFTER button state has changed."""
         current_item = self.chapter_tree.currentItem()
-        if current_item:
+        if current_item and isinstance(current_item, ChapterTreeItem):
+            # The button's state has already changed by the click action.
+            # show_content will use the new state to determine what to display and set button text.
             self.show_content(current_item)
+        elif not current_item: # No item selected, just toggle button text based on new state
+            if self.summary_mode_btn.isChecked(): # Means it now wants to show original
+                 self.summary_mode_btn.setText("显示要点")
+            else: # Means it now wants to show summary
+                 self.summary_mode_btn.setText("显示原文")
+
 
     def get_current_model_name(self):
         """获取当前选择的模型名称"""
@@ -684,7 +726,7 @@ class MainWindow(QMainWindow):
                 "key": self.api_key_input.text().strip(),
                 "model": self.get_current_model_name()
             }
-            self.llm_processor = LLMProcessor(api_config)
+            self.llm_processor = LLMProcessor(api_config, self) # Pass MainWindow instance
             
             # 添加任务到队列
             self.work_queue.put((current, context))
@@ -720,7 +762,7 @@ class MainWindow(QMainWindow):
                 "key": self.api_key_input.text().strip(),
                 "model": self.get_current_model_name()
             }
-            self.llm_processor = LLMProcessor(api_config)
+            self.llm_processor = LLMProcessor(api_config, self) # Pass MainWindow instance
             
             # 添加所有任务
             for task in tasks:
@@ -787,12 +829,13 @@ class MainWindow(QMainWindow):
             item, summary = data
             item.summary = summary
             item.is_summarized = True
-            item.summary_timestamp = time.time()  # 更新时间戳
+            item.summary_timestamp = time.time()
+            item.update_display_text() # Update visual marker
             
-            # 如果当前显示的是这个项目，更新显示
+            # Refresh content display for the updated item if it's the current one
             current_item = self.chapter_tree.currentItem()
-            if current_item == item and self.summary_mode_btn.isChecked():
-                self.content_display.setText(summary)
+            if current_item == item:
+                self.show_content(item)
 
     def handle_error(self, error_msg):
         """处理错误"""
@@ -814,18 +857,30 @@ class MainWindow(QMainWindow):
         """导出提炼结果"""
         if not self.default_export_path:
             reply = QMessageBox.question(
-                self, '导出路径',
+                self, '设置导出路径',
                 '未设置默认导出路径，是否现在设置？',
-                QMessageBox.Yes | QMessageBox.No
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No # Default to No
             )
             if reply == QMessageBox.Yes:
                 self.set_export_path()
+                # After attempting to set, check if it's actually set
+                if not self.default_export_path:
+                    QMessageBox.warning(self, "导出取消", "未选择导出路径，导出操作已取消。")
+                    return
             else:
+                QMessageBox.information(self, "导出取消", "未设置导出路径，导出操作已取消。")
                 return
+
+        # Ensure book_data and title are available
+        if not self.book_data or not self.book_data.get("title"):
+            QMessageBox.warning(self, "错误", "没有加载小说信息，无法导出。")
+            return
 
         try:
             # 创建输出目录
-            book_dir = os.path.join(self.default_export_path, f"{self.book_data['title']}_提炼结果")
+            book_title = self.book_data.get("title", "未命名小说")
+            book_dir = os.path.join(self.default_export_path, f"{book_title}_提炼结果")
             os.makedirs(book_dir, exist_ok=True)
 
             # 导出不同格式
@@ -839,11 +894,42 @@ class MainWindow(QMainWindow):
 
     def export_txt(self, path):
         """导出TXT格式"""
-        with open(os.path.join(path, f"{self.book_data['title']}_提炼总结.txt"), 'w', encoding='utf-8') as f:
-            f.write(f"{self.book_data['title']} 提炼总结\n")
-            f.write("=" * 50 + "\n\n")
-            
-            root = self.chapter_tree.invisibleRootItem()
+        file_name = os.path.join(path, f"{self.book_data.get('title', '未命名小说')}_提炼总结.txt")
+        try:
+            with open(file_name, 'w', encoding='utf-8') as f:
+                f.write(f"{self.book_data.get('title', '未命名小说')} 提炼总结\n")
+                f.write("=" * 50 + "\n\n")
+
+                root = self.chapter_tree.invisibleRootItem()
+                for i in range(root.childCount()):
+                    vol = root.child(i)
+                    f.write(f"{vol.text(0)}\n")
+                    f.write("-" * 40 + "\n")
+
+                    for j in range(vol.childCount()):
+                        chap = vol.child(j)
+                        if chap.is_summarized:
+                            f.write(f"\n{chap.text(0)}\n")
+                            f.write("-" * 20 + "\n")
+                            f.write(f"{chap.summary}\n")
+
+                    f.write("\n\n")
+        except IOError as e:
+            QMessageBox.critical(self, "导出错误", f"写入TXT文件失败: {file_name}\n{str(e)}")
+        except Exception as e:
+            QMessageBox.critical(self, "导出错误", f"导出TXT时发生未知错误: {str(e)}")
+
+    def export_markdown(self, path):
+        """导出Markdown格式"""
+        file_name = os.path.join(path, f"{self.book_data.get('title', '未命名小说')}_提炼总结.md")
+        try:
+            with open(file_name, 'w', encoding='utf-8') as f:
+                f.write(f"# {self.book_data.get('title', '未命名小说')} 提炼总结\n\n")
+                f.write(f"**生成时间:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                f.write(f"**Token消耗:** 输入 {self.total_tokens[0]} | 输出 {self.total_tokens[1]}\n\n")
+                f.write("---\n\n")
+
+                root = self.chapter_tree.invisibleRootItem()
             for i in range(root.childCount()):
                 vol = root.child(i)
                 f.write(f"{vol.text(0)}\n")
@@ -876,11 +962,15 @@ class MainWindow(QMainWindow):
                     if chap.is_summarized:
                         f.write(f"### {chap.text(0)}\n\n")
                         f.write(f"{chap.summary}\n\n")
+        except IOError as e:
+            QMessageBox.critical(self, "导出错误", f"写入Markdown文件失败: {file_name}\n{str(e)}")
+        except Exception as e:
+            QMessageBox.critical(self, "导出错误", f"导出Markdown时发生未知错误: {str(e)}")
 
     def export_json(self, path):
         """导出JSON格式"""
         data = {
-            "title": self.book_data["title"],
+            "title": self.book_data.get('title', '未命名小说'),
             "export_time": time.strftime('%Y-%m-%d %H:%M:%S'),
             "token_usage": {
                 "input": self.total_tokens[0],
@@ -913,13 +1003,22 @@ class MainWindow(QMainWindow):
 
         with open(os.path.join(path, f"{self.book_data['title']}_数据.json"), 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        except IOError as e:
+            QMessageBox.critical(self, "导出错误", f"写入JSON文件失败: {file_name}\n{str(e)}")
+        except Exception as e:
+            QMessageBox.critical(self, "导出错误", f"导出JSON时发生未知错误: {str(e)}")
+
 
     def set_export_path(self):
         """设置默认导出路径"""
         path = QFileDialog.getExistingDirectory(self, "选择默认导出目录")
         if path:
             self.default_export_path = path
-            self.status_label.setText(f"导出目录设置为: {path}")
+            self.status_label.setText(f"导出目录已设置为: {path}")
+            QMessageBox.information(self, "设置成功", f"默认导出目录已设置为:\n{path}")
+        else:
+            self.status_label.setText("导出目录未更改")
+            # QMessageBox.information(self, "设置取消", "未选择目录，导出路径未更改。") # Optional: can be noisy
 
     def add_custom_model(self):
         """添加自定义模型"""
@@ -977,11 +1076,16 @@ class MainWindow(QMainWindow):
             "api_url": self.api_url_input.text(),
             "api_key": self.api_key_input.text(),
             "export_path": self.default_export_path,
-            "custom_models": {k: v for k, v in self.model_configs.items() if k.startswith('custom_')},
-            "book_data": self.book_data,
+            "custom_models": {k: v for k, v in self.model_configs.items() if k.startswith('custom_')}, # Save only custom models explicitly added by user
+            "book_data": { # Ensure all necessary book_data fields are saved
+                "title": self.book_data.get("title"),
+                "file_path": self.book_data.get("file_path"),
+                "encoding": self.book_data.get("encoding"),
+                "volumes": self.book_data.get("volumes", []) # Retain volumes if they exist
+            },
             "summary_mode": self.summary_mode_btn.isChecked(),
-            "custom_prompt": self.custom_prompt,
-            "chapter_states": self.get_chapter_states()  # 新增章节状态记录
+            "custom_prompt": self.custom_prompt_input.text(), # Get current prompt from input field
+            "chapter_states": self.get_chapter_states()
         }
         
         try:
@@ -1034,22 +1138,33 @@ class MainWindow(QMainWindow):
                 self.api_url_input.setText(config.get("api_url", ""))
                 self.api_key_input.setText(config.get("api_key", ""))
                 self.default_export_path = config.get("export_path", "")
-                
-                if "book_data" in config:
-                    self.book_data = config["book_data"]
-                    if "file_path" in self.book_data:
-                        self.reload_novel()  # 新增重新加载小说方法
+                self.custom_prompt = config.get("custom_prompt", self.custom_prompt) # Restore custom_prompt
+                self.prompt_input.setText(self.custom_prompt) # Update prompt input field
+
+                loaded_book_data = config.get("book_data")
+                if loaded_book_data and loaded_book_data.get("file_path") and loaded_book_data.get("encoding"):
+                    self.book_data = loaded_book_data
+                    self.reload_novel()
         
-                # 恢复章节状态
+                # 恢复章节状态 (should be after reload_novel if novel is loaded)
                 if "chapter_states" in config:
                     self.restore_chapter_states(config["chapter_states"])
                 
-                # 恢复显示模式
-                if "summary_mode" in config:
+                # 恢复显示模式 - This needs to be after items are potentially reloaded and states restored
+                if "summary_mode" in config and isinstance(config["summary_mode"], bool):
                     self.summary_mode_btn.setChecked(config["summary_mode"])
-                    self.toggle_display_mode()
 
-                QMessageBox.information(self, "成功", "配置已加载")
+                # Update button text based on loaded state, especially if no item is selected after load.
+                # If an item IS selected (e.g. after reload_novel), show_content would have set this.
+                if not self.chapter_tree.currentItem(): # Only adjust if no item is actively displayed
+                    if self.summary_mode_btn.isChecked(): # Checked means "user wants original"
+                        self.summary_mode_btn.setText("显示要点")
+                    else: # Not checked means "user wants summary" (or default)
+                        self.summary_mode_btn.setText("显示原文")
+
+                # Update status bar or show message only if not reloading novel (to avoid double messages)
+                if not (loaded_book_data and loaded_book_data.get("file_path")):
+                    QMessageBox.information(self, "成功", "配置已加载")
             else:
                 QMessageBox.information(self, "提示", "未找到配置文件")
         except Exception as e:
@@ -1057,13 +1172,33 @@ class MainWindow(QMainWindow):
 
     def reload_novel(self):
         """重新加载上次打开的小说"""
+        file_path = self.book_data.get("file_path")
+        encoding = self.book_data.get("encoding")
+
+        if not file_path or not encoding:
+            print("重新加载小说失败: 文件路径或编码未在book_data中设置")
+            return
+
+        self.status_label.setText(f"重新加载: {self.book_data.get('title', '未知标题')}...")
+        QApplication.processEvents()
         try:
-            with open(self.book_data["file_path"], 'r', encoding=self.book_data["encoding"]) as f:
+            with open(file_path, 'r', encoding=encoding) as f:
                 content = f.read()
+
+            # Parse chapters and rebuild tree
             chapters = self.parse_chapters(content)
-            self.build_chapter_tree(chapters)
+            self.build_chapter_tree(chapters) # This will set the book title in the tree
+
+            self.status_label.setText(f"已重新加载: {self.book_data.get('title', '未知标题')}")
+            # QMessageBox.information(self, "小说已重新加载", f"{self.book_data.get('title', '未知标题')} 已成功加载。")
+
+        except FileNotFoundError:
+            QMessageBox.critical(self, "错误", f"重新加载小说失败: 文件未找到 {file_path}")
+            self.status_label.setText("重新加载失败: 文件未找到")
         except Exception as e:
-            print(f"重新加载小说失败: {str(e)}")
+            QMessageBox.critical(self, "错误", f"重新加载小说失败: {str(e)}")
+            self.status_label.setText(f"重新加载失败: {str(e)}")
+
 
     def restore_chapter_states(self, states):
         """恢复章节处理状态"""
@@ -1076,9 +1211,10 @@ class MainWindow(QMainWindow):
                     for j in range(vol.childCount()):
                         chap = vol.child(j)
                         if chap.text(0) == chap_title and isinstance(chap, ChapterTreeItem):
-                            chap.is_summarized = state["is_summarized"]
-                            chap.summary = state["summary"]
-                            chap.summary_timestamp = state["timestamp"]
+                            chap.is_summarized = state.get("is_summarized", False)
+                            chap.summary = state.get("summary", "")
+                            chap.summary_timestamp = state.get("timestamp", 0)
+                            chap.update_display_text() # Add marker if loaded state is summarized
 
     def update_prompt(self):
         """更新自定义提示词"""
@@ -1097,7 +1233,9 @@ class MainWindow(QMainWindow):
             }
             
             # 创建处理器并测试
-            processor = LLMProcessor(api_config)
+            # For test_connection, we might not have a fully initialized LLMProcessor instance member yet,
+            # so create a local one and pass 'self' (MainWindow) for custom_prompt access.
+            processor = LLMProcessor(api_config, self) # Pass MainWindow instance
             test_text = "这是一个连接测试。"
             
             self.status_label.setText("正在测试连接...")
@@ -1169,10 +1307,10 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.Yes:
                 self.worker_thread.stop()
                 self.worker_thread.wait(3000)
-                event.accept()
-            else:
-                event.ignore()
+            self.save_config() # Save config before exiting
+            event.accept()
         else:
+            self.save_config() # Save config before exiting
             event.accept()
 
 
@@ -1184,6 +1322,7 @@ if __name__ == "__main__":
     app.setApplicationVersion("2.0")
     
     window = MainWindow()
+    window.load_config() # Load config on startup
     window.show()
     
     sys.exit(app.exec_())
