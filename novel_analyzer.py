@@ -987,24 +987,27 @@ class MainWindow(QMainWindow):
                 f.write("---\n\n")
 
                 book_item = self.chapter_tree.topLevelItem(0)
-                if not book_item: return
+                if not book_item:
+                    return # Exit if no book item, though export_results should prevent this.
 
-            for i in range(book_item.childCount()): # Iterate through volumes
-                vol_item = book_item.child(i)
-                f.write(f"## {vol_item.text(0)}\n\n") # Volume title
+                # Corrected loop indentation starts here
+                for i in range(book_item.childCount()): # Iterate through volumes
+                    vol_item = book_item.child(i)
+                    f.write(f"## {vol_item.text(0)}\n\n") # Volume title
 
-                for j in range(vol_item.childCount()): # Iterate through chapters
-                    chapter_item = vol_item.child(j)
-                    if not isinstance(chapter_item, ChapterTreeItem): continue
+                    for j in range(vol_item.childCount()): # Iterate through chapters
+                        chapter_item = vol_item.child(j)
+                        if not isinstance(chapter_item, ChapterTreeItem): continue
 
-                    title_to_write = chapter_item.original_title if hasattr(chapter_item, 'original_title') else chapter_item.text(0)
+                        title_to_write = chapter_item.original_title if hasattr(chapter_item, 'original_title') else chapter_item.text(0)
 
-                    if chapter_item.is_summarized and chapter_item.summary:
-                        f.write(f"### {title_to_write} (提炼后)\n\n")
-                        f.write(f"{chapter_item.summary}\n\n")
-                    else:
-                        f.write(f"### {title_to_write} (原文)\n\n")
-                        f.write(f"{chapter_item.content}\n\n")
+                        if chapter_item.is_summarized and chapter_item.summary:
+                            f.write(f"### {title_to_write} (提炼后)\n\n")
+                            f.write(f"{chapter_item.summary}\n\n")
+                        else:
+                            f.write(f"### {title_to_write} (原文)\n\n")
+                            f.write(f"{chapter_item.content}\n\n")
+            # 'with' block ends here, after all writes
         except IOError as e:
             QMessageBox.critical(self, "导出错误", f"写入Markdown文件失败: {file_name}\n{str(e)}")
         except Exception as e:
@@ -1159,19 +1162,27 @@ class MainWindow(QMainWindow):
     def get_chapter_states(self):
         """获取所有章节处理状态"""
         states = []
-        root = self.chapter_tree.invisibleRootItem()
-        for i in range(root.childCount()):
-            vol = root.child(i)
-            for j in range(vol.childCount()):
-                chap = vol.child(j)
-                if isinstance(chap, ChapterTreeItem):
+        if self.chapter_tree.topLevelItemCount() == 0:
+            return states
+
+        book_item = self.chapter_tree.topLevelItem(0)
+        if not book_item:
+            return states
+
+        for i in range(book_item.childCount()): # Iterate through volumes
+            vol_item = book_item.child(i)
+            for j in range(vol_item.childCount()): # Iterate through chapters
+                chapter_item = vol_item.child(j)
+                if isinstance(chapter_item, ChapterTreeItem):
+                    # Use original_title for the chapter part of the path
+                    path_chap_title = chapter_item.original_title if hasattr(chapter_item, 'original_title') else chapter_item.text(0)
                     states.append({
-                        "path": [vol.text(0), chap.text(0)],
-                        "is_summarized": chap.is_summarized,
-                        "summary": chap.summary,
-                        "timestamp": chap.summary_timestamp,
-                        "content": chap.content, # Save content
-                        "word_count": chap.word_count # Save word count
+                        "path": [vol_item.text(0), path_chap_title],
+                        "is_summarized": chapter_item.is_summarized,
+                        "summary": chapter_item.summary,
+                        "timestamp": chapter_item.summary_timestamp,
+                        "content": chapter_item.content,
+                        "word_count": chapter_item.word_count
                     })
         return states
 
@@ -1265,28 +1276,41 @@ class MainWindow(QMainWindow):
 
     def restore_chapter_states(self, states):
         """恢复章节处理状态"""
-        root = self.chapter_tree.invisibleRootItem()
+        if self.chapter_tree.topLevelItemCount() == 0:
+            return # No book structure to restore into
+
+        book_item = self.chapter_tree.topLevelItem(0)
+        if not book_item:
+            return
+
         for state in states:
-            vol_title, chap_title = state["path"]
-            for i in range(root.childCount()):
-                vol = root.child(i)
-                if vol.text(0) == vol_title:
-                    for j in range(vol.childCount()):
-                        chap = vol.child(j)
-                        if chap.text(0) == chap_title and isinstance(chap, ChapterTreeItem):
-                            chap.is_summarized = state.get("is_summarized", False)
-                            chap.summary = state.get("summary", "")
-                            chap.summary_timestamp = state.get("timestamp", 0)
-                            # Restore content and word count
-                            if "content" in state: # Check for backward compatibility
-                                chap.content = state["content"]
+            vol_title, chap_title_from_state = state["path"]
+            for i in range(book_item.childCount()): # Iterate through volume items in tree
+                vol_item = book_item.child(i)
+                if vol_item.text(0) == vol_title:
+                    for j in range(vol_item.childCount()): # Iterate through chapter items in tree
+                        chapter_item = vol_item.child(j)
+                        # Match using original_title
+                        if isinstance(chapter_item, ChapterTreeItem) and \
+                           (chapter_item.original_title == chap_title_from_state or
+                            (not hasattr(chapter_item, 'original_title') and chapter_item.text(0) == chap_title_from_state)): # Fallback for older items
+
+                            chapter_item.is_summarized = state.get("is_summarized", False)
+                            chapter_item.summary = state.get("summary", "")
+                            chapter_item.summary_timestamp = state.get("timestamp", 0)
+
+                            if "content" in state:
+                                chapter_item.content = state["content"]
                             if "word_count" in state:
-                                chap.word_count = state["word_count"]
-                                chap.setText(1, f"{chap.word_count}字") # Update tree display for word count
-                            else: # Recalculate if not found (older config)
-                                chap.word_count = len(chap.content)
-                                chap.setText(1, f"{chap.word_count}字")
-                            chap.update_display_text() # Add marker if loaded state is summarized
+                                chapter_item.word_count = state["word_count"]
+                                chapter_item.setText(1, f"{chapter_item.word_count}字")
+                            else: # Recalculate if not present
+                                chapter_item.word_count = len(chapter_item.content)
+                                chapter_item.setText(1, f"{chapter_item.word_count}字")
+
+                            chapter_item.update_display_text()
+                            break # Found chapter, move to next state
+                    break # Found volume, move to next state
 
     def update_prompt(self):
         """更新自定义提示词"""
