@@ -214,7 +214,7 @@ class MainWindow(QMainWindow):
         self.worker_thread = None
         self.total_tokens = [0, 0]  # [input, output]
         self.default_export_path = ""
-        self.custom_prompt = "作为专业编辑，请用原文语言提炼以下内容的核心要点（保留关键情节和人物关系，压缩至原文1%字数）："
+        self.custom_prompt = "提炼以下文本的核心要点，仅输出提炼后的内容，不要包含任何额外解释或与原文无关的文字。保留关键情节和人物关系，压缩至原文1%字数："
 
         # 预定义的模型配置
         self.model_configs = {
@@ -393,6 +393,7 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(0, header.Stretch) # Chapter/Volume Name column
         header.setMinimumSectionSize(250) # Minimum width for chapter/volume column
         header.setSectionResizeMode(1, header.ResizeToContents) # Word Count column
+        header.setStretchLastSection(False) # Add this line
 
         splitter.addWidget(self.chapter_tree)
 
@@ -420,6 +421,16 @@ class MainWindow(QMainWindow):
         self.export_btn = QPushButton("导出结果")
         self.export_btn.clicked.connect(self.export_results)
         btn_layout.addWidget(self.export_btn)
+
+        self.edit_chapter_btn = QPushButton("编辑章节")
+        self.edit_chapter_btn.clicked.connect(self.enable_chapter_editing)
+        self.edit_chapter_btn.setEnabled(False) # Initially disabled
+        btn_layout.addWidget(self.edit_chapter_btn)
+
+        self.save_chapter_btn = QPushButton("保存修改")
+        self.save_chapter_btn.clicked.connect(self.save_chapter_edits)
+        self.save_chapter_btn.setEnabled(False) # Initially disabled
+        btn_layout.addWidget(self.save_chapter_btn)
         
         right_panel.addLayout(btn_layout)
 
@@ -665,35 +676,70 @@ class MainWindow(QMainWindow):
         if not isinstance(item, ChapterTreeItem):
             self.content_display.clear()
             self.summary_mode_btn.setEnabled(False) # Disable button if no valid item selected
-            self.summary_mode_btn.setText("显示原文") # Reset text
+            self.summary_mode_btn.setText("显示原文") # Reset text for consistency
+            self.summary_mode_btn.setText("显示原文") # Reset text for consistency
+            self.summary_mode_btn.setChecked(False) # Ensure button is not left checked
+            self.content_display.setReadOnly(True) # Ensure content display is read-only
+            # Disable editing buttons if no valid chapter item is selected
+            self.edit_chapter_btn.setEnabled(False)
+            self.save_chapter_btn.setEnabled(False)
+            # Re-enable other general buttons if they were disabled by editing
+            self.summarize_btn.setEnabled(True) # Assuming a book is loaded
+            self.summarize_all_btn.setEnabled(True) # Assuming a book is loaded
+            self.export_btn.setEnabled(True) # Assuming a book is loaded
+            self.load_btn.setEnabled(True)
             return
+
+        # Item is a ChapterTreeItem or similar (e.g. volume root)
+        self.content_display.setReadOnly(True) # Default to read-only
+        self.save_chapter_btn.setEnabled(False) # Save button disabled by default
+
+        is_chapter = isinstance(item, ChapterTreeItem)
+        self.edit_chapter_btn.setEnabled(is_chapter) # Enable edit only for chapters
+
+        # General buttons re-enabled when selection changes and not in edit mode
+        self.summarize_btn.setEnabled(is_chapter) # Summarize current only for chapters
+        self.summarize_all_btn.setEnabled(True) # Always enabled if a book is loaded
+        self.export_btn.setEnabled(True) # Always enabled if a book is loaded
+        self.load_btn.setEnabled(True)
+
 
         if item.is_summarized:
             self.summary_mode_btn.setEnabled(True)
-            if self.summary_mode_btn.isChecked(): # User explicitly wants to see original
-                self.content_display.setText(item.content)
-                self.summary_mode_btn.setText("显示要点") # Next click will show summary
-            else: # Default for summarized items: show summary
-                self.content_display.setText(item.summary)
-                self.summary_mode_btn.setText("显示原文") # Next click will show original
-        else: # Not summarized, always show original content
-            self.content_display.setText(item.content)
-            self.summary_mode_btn.setText("显示要点") # Next click would show summary (but no summary exists)
-            self.summary_mode_btn.setEnabled(False) # Disable button if no summary to toggle to
+            self.summary_mode_btn.setChecked(False)
+            self.content_display.setText(item.summary)
+            self.summary_mode_btn.setText("显示原文")
+        else: # Not summarized (or not summarizable, e.g. a volume item)
+            self.content_display.setText(item.content if is_chapter else "") # Show content for chapter, nothing for volume
+            self.summary_mode_btn.setText("显示要点")
+            self.summary_mode_btn.setChecked(False)
+            self.summary_mode_btn.setEnabled(is_chapter and item.is_summarized) # Enable toggle only if it's a chapter AND has a summary
 
     def toggle_display_mode(self):
-        """切换显示模式 (原文/提炼后). Called AFTER button state has changed."""
+        """切换显示模式 (原文/提炼后). Called AFTER button state has changed by user click."""
         current_item = self.chapter_tree.currentItem()
-        if current_item and isinstance(current_item, ChapterTreeItem):
-            # The button's state has already changed by the click action.
-            # show_content will use the new state to determine what to display and set button text.
-            self.show_content(current_item)
-        elif not current_item: # No item selected, just toggle button text based on new state
-            if self.summary_mode_btn.isChecked(): # Means it now wants to show original
-                 self.summary_mode_btn.setText("显示要点")
-            else: # Means it now wants to show summary
-                 self.summary_mode_btn.setText("显示原文")
 
+        if current_item and isinstance(current_item, ChapterTreeItem):
+            if current_item.is_summarized:
+                # Button state has already been toggled by the click.
+                if self.summary_mode_btn.isChecked(): # Now checked, so user wants to see Original
+                    self.content_display.setText(current_item.content)
+                    self.summary_mode_btn.setText("显示要点")
+                else: # Now unchecked, so user wants to see Summary
+                    self.content_display.setText(current_item.summary)
+                    self.summary_mode_btn.setText("显示原文")
+            else:
+                # Should not happen if button is disabled for non-summarized items, but as a fallback:
+                self.content_display.setText(current_item.content)
+                self.summary_mode_btn.setText("显示要点")
+                self.summary_mode_btn.setEnabled(False)
+        elif not current_item: # No item selected
+             # This case should ideally not be hit if button is disabled when no item selected,
+             # but if it is, sync text with (now changed) check state.
+            if self.summary_mode_btn.isChecked():
+                 self.summary_mode_btn.setText("显示要点")
+            else:
+                 self.summary_mode_btn.setText("显示原文")
 
     def get_current_model_name(self):
         """获取当前选择的模型名称"""
@@ -835,7 +881,7 @@ class MainWindow(QMainWindow):
             # Refresh content display for the updated item if it's the current one
             current_item = self.chapter_tree.currentItem()
             if current_item == item:
-                self.show_content(item)
+                self.show_content(item) # This will now apply the default logic
 
     def handle_error(self, error_msg):
         """处理错误"""
@@ -855,6 +901,10 @@ class MainWindow(QMainWindow):
 
     def export_results(self):
         """导出提炼结果"""
+        if not self.book_data.get("title") or self.chapter_tree.topLevelItemCount() == 0:
+            QMessageBox.warning(self, "导出错误", "没有加载小说或小说内容为空，无法导出。")
+            return
+
         if not self.default_export_path:
             reply = QMessageBox.question(
                 self, '设置导出路径',
@@ -864,24 +914,22 @@ class MainWindow(QMainWindow):
             )
             if reply == QMessageBox.Yes:
                 self.set_export_path()
-                # After attempting to set, check if it's actually set
-                if not self.default_export_path:
+                if not self.default_export_path: # Check again if path was actually set
                     QMessageBox.warning(self, "导出取消", "未选择导出路径，导出操作已取消。")
                     return
             else:
                 QMessageBox.information(self, "导出取消", "未设置导出路径，导出操作已取消。")
                 return
 
-        # Ensure book_data and title are available
+        # Ensure book_data and title are available (redundant with earlier check, but safe)
         if not self.book_data or not self.book_data.get("title"):
-            QMessageBox.warning(self, "错误", "没有加载小说信息，无法导出。")
+            QMessageBox.warning(self, "错误", "没有加载小说信息，无法导出。") # Should be caught by first check
             return
 
         try:
-            # 创建输出目录
             book_title = self.book_data.get("title", "未命名小说")
             book_dir = os.path.join(self.default_export_path, f"{book_title}_提炼结果")
-            os.makedirs(book_dir, exist_ok=True)
+            os.makedirs(book_dir, exist_ok=True) # Ensure directory is created before writing files
 
             # 导出不同格式
             self.export_txt(book_dir)
@@ -903,17 +951,24 @@ class MainWindow(QMainWindow):
                 root = self.chapter_tree.invisibleRootItem()
                 for i in range(root.childCount()):
                     vol = root.child(i)
-                    f.write(f"{vol.text(0)}\n")
+                    f.write(f"{vol.text(0)}\n") # Volume title
                     f.write("-" * 40 + "\n")
 
                     for j in range(vol.childCount()):
                         chap = vol.child(j)
-                        if chap.is_summarized:
-                            f.write(f"\n{chap.text(0)}\n")
-                            f.write("-" * 20 + "\n")
-                            f.write(f"{chap.summary}\n")
+                        if not isinstance(chap, ChapterTreeItem): continue
 
-                    f.write("\n\n")
+                        title_to_write = chap.original_title if hasattr(chap, 'original_title') else chap.text(0)
+
+                        if chap.is_summarized and chap.summary:
+                            f.write(f"【提炼总结】 {title_to_write}\n")
+                            f.write("-" * 20 + "\n")
+                            f.write(f"{chap.summary}\n\n")
+                        else:
+                            f.write(f"【原文】 {title_to_write}\n")
+                            f.write("-" * 20 + "\n")
+                            f.write(f"{chap.content}\n\n")
+                    f.write("\n") # Extra newline after each volume's content
         except IOError as e:
             QMessageBox.critical(self, "导出错误", f"写入TXT文件失败: {file_name}\n{str(e)}")
         except Exception as e:
@@ -930,38 +985,22 @@ class MainWindow(QMainWindow):
                 f.write("---\n\n")
 
                 root = self.chapter_tree.invisibleRootItem()
-            for i in range(root.childCount()):
+            for i in range(root.childCount()): # Iterating through book title item's children (volumes)
                 vol = root.child(i)
-                f.write(f"{vol.text(0)}\n")
-                f.write("-" * 40 + "\n")
-                
-                for j in range(vol.childCount()):
+                f.write(f"## {vol.text(0)}\n\n") # Volume title
+
+                for j in range(vol.childCount()): # Iterating through volume's children (chapters)
                     chap = vol.child(j)
-                    if chap.is_summarized:
-                        f.write(f"\n{chap.text(0)}\n")
-                        f.write("-" * 20 + "\n")
-                        f.write(f"{chap.summary}\n")
-                
-                f.write("\n\n")
+                    if not isinstance(chap, ChapterTreeItem): continue
 
-    def export_markdown(self, path):
-        """导出Markdown格式"""
-        with open(os.path.join(path, f"{self.book_data['title']}_提炼总结.md"), 'w', encoding='utf-8') as f:
-            f.write(f"# {self.book_data['title']} 提炼总结\n\n")
-            f.write(f"**生成时间:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-            f.write(f"**Token消耗:** 输入 {self.total_tokens[0]} | 输出 {self.total_tokens[1]}\n\n")
-            f.write("---\n\n")
+                    title_to_write = chap.original_title if hasattr(chap, 'original_title') else chap.text(0)
 
-            root = self.chapter_tree.invisibleRootItem()
-            for i in range(root.childCount()):
-                vol = root.child(i)
-                f.write(f"## {vol.text(0)}\n\n")
-
-                for j in range(vol.childCount()):
-                    chap = vol.child(j)
-                    if chap.is_summarized:
-                        f.write(f"### {chap.text(0)}\n\n")
+                    if chap.is_summarized and chap.summary:
+                        f.write(f"### {title_to_write} (提炼后)\n\n")
                         f.write(f"{chap.summary}\n\n")
+                    else:
+                        f.write(f"### {title_to_write} (原文)\n\n")
+                        f.write(f"{chap.content}\n\n")
         except IOError as e:
             QMessageBox.critical(self, "导出错误", f"写入Markdown文件失败: {file_name}\n{str(e)}")
         except Exception as e:
@@ -987,22 +1026,42 @@ class MainWindow(QMainWindow):
                 "chapters": []
             }
 
-            for j in range(vol.childCount()):
+            for j in range(vol.childCount()): # Iterating through volume's children (chapters)
                 chap = vol.child(j)
-                if chap.is_summarized:
-                    chapter_data = {
-                        "title": chap.text(0),
-                        "original_length": chap.word_count,
-                        "summary": chap.summary,
-                        "summary_length": len(chap.summary)
-                    }
-                    volume_data["chapters"].append(chapter_data)
+                if not isinstance(chap, ChapterTreeItem): continue
 
+                title_to_write = chap.original_title if hasattr(chap, 'original_title') else chap.text(0)
+                content_to_export = ""
+                status = "original"
+                # Use stored word_count for original, calculate for summary
+                content_length = chap.word_count
+
+                if chap.is_summarized and chap.summary:
+                    content_to_export = chap.summary
+                    status = "refined"
+                    content_length = len(chap.summary)
+                else:
+                    content_to_export = chap.content
+                    # status is already "original"
+                    # content_length is already chap.word_count from initialization or edit
+
+                chapter_data = {
+                    "title": title_to_write,
+                    "status": status,
+                    "content": content_to_export,
+                    "length": content_length
+                }
+                volume_data["chapters"].append(chapter_data)
+
+            # Add volume_data to data if it contains any chapters.
+            # This ensures empty volumes (if such a case arises) are not added.
             if volume_data["chapters"]:
                 data["volumes"].append(volume_data)
 
-        with open(os.path.join(path, f"{self.book_data['title']}_数据.json"), 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        file_name = os.path.join(path, f"{self.book_data.get('title', '未命名小说')}_数据.json")
+        try:
+            with open(file_name, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
         except IOError as e:
             QMessageBox.critical(self, "导出错误", f"写入JSON文件失败: {file_name}\n{str(e)}")
         except Exception as e:
@@ -1108,7 +1167,9 @@ class MainWindow(QMainWindow):
                         "path": [vol.text(0), chap.text(0)],
                         "is_summarized": chap.is_summarized,
                         "summary": chap.summary,
-                        "timestamp": chap.summary_timestamp
+                        "timestamp": chap.summary_timestamp,
+                        "content": chap.content, # Save content
+                        "word_count": chap.word_count # Save word count
                     })
         return states
 
@@ -1214,6 +1275,15 @@ class MainWindow(QMainWindow):
                             chap.is_summarized = state.get("is_summarized", False)
                             chap.summary = state.get("summary", "")
                             chap.summary_timestamp = state.get("timestamp", 0)
+                            # Restore content and word count
+                            if "content" in state: # Check for backward compatibility
+                                chap.content = state["content"]
+                            if "word_count" in state:
+                                chap.word_count = state["word_count"]
+                                chap.setText(1, f"{chap.word_count}字") # Update tree display for word count
+                            else: # Recalculate if not found (older config)
+                                chap.word_count = len(chap.content)
+                                chap.setText(1, f"{chap.word_count}字")
                             chap.update_display_text() # Add marker if loaded state is summarized
 
     def update_prompt(self):
@@ -1288,11 +1358,89 @@ class MainWindow(QMainWindow):
 
     def auto_save(self):
         """自动保存配置"""
-        if self.book_data.get("file_path"):
+        if self.book_data.get("file_path"): # Only save if a book is loaded
             try:
+                # Ensure not in editing mode before auto-saving
+                if not self.content_display.isReadOnly():
+                    print("自动保存已跳过：章节正在编辑中。") # Auto-save skipped: chapter editing in progress.
+                    return
                 self.save_config()
+                # self.status_label.setText(f"自动保存于 {time.strftime('%H:%M:%S')}") # Optional: feedback for auto-save
             except Exception as e:
                 print(f"自动保存失败: {str(e)}")
+
+    def enable_chapter_editing(self):
+        """Enables editing for the currently selected chapter's original content."""
+        current_item = self.chapter_tree.currentItem()
+        if not isinstance(current_item, ChapterTreeItem):
+            QMessageBox.warning(self, "无法编辑", "请先选择一个章节进行编辑。")
+            return
+
+        # Check if summary is displayed (and item is summarized)
+        # summary_mode_btn isChecked means "user wants original" (text is "Show Summary")
+        # summary_mode_btn not isChecked means "user wants summary" (text is "Show Original")
+        if current_item.is_summarized and not self.summary_mode_btn.isChecked():
+             QMessageBox.warning(self, "编辑冲突", "正在显示摘要，请切换到原文以进行编辑。")
+             return
+
+        self.content_display.setReadOnly(False)
+        # Ensure original content is loaded for editing, even if summary was somehow displayed
+        self.content_display.setText(current_item.content)
+
+        self.edit_chapter_btn.setEnabled(False)
+        self.save_chapter_btn.setEnabled(True)
+
+        # Disable other actions that might interfere
+        self.summarize_btn.setEnabled(False)
+        self.summarize_all_btn.setEnabled(False)
+        self.export_btn.setEnabled(False)
+        self.load_btn.setEnabled(False) # Disable load button during editing
+        self.summary_mode_btn.setEnabled(False) # Disable mode toggle during edit
+
+        self.status_label.setText("章节编辑模式...")
+
+
+    def save_chapter_edits(self):
+        """Saves the edited content of the current chapter."""
+        current_item = self.chapter_tree.currentItem()
+        if not isinstance(current_item, ChapterTreeItem):
+            # This case should ideally not be reached if button states are managed well
+            QMessageBox.critical(self, "错误", "没有选中有效章节以保存。")
+            return
+
+        current_item.content = self.content_display.toPlainText()
+        current_item.word_count = len(current_item.content)
+        current_item.setText(1, f"{current_item.word_count}字") # Update word count in tree
+
+        # If the chapter was summarized, its summary is now potentially outdated.
+        # We could clear the summary, or mark it as needing re-summary, or leave it.
+        # For now, let's consider the summary stale. We'll clear the visual marker.
+        # The user would need to re-summarize.
+        if current_item.is_summarized:
+            # current_item.is_summarized = False # Option 1: Mark as not summarized
+            # current_item.summary = "" # Option 2: Clear summary
+            # For now, just update display text if it had marker, user can re-summarize
+            pass # The existing summary remains, user responsibility to re-summarize if needed
+
+        self.content_display.setReadOnly(True)
+        self.edit_chapter_btn.setEnabled(True)
+        self.save_chapter_btn.setEnabled(False)
+
+        # Re-enable other actions
+        self.summarize_btn.setEnabled(True)
+        self.summarize_all_btn.setEnabled(True)
+        self.export_btn.setEnabled(True)
+        self.load_btn.setEnabled(True)
+        if current_item.is_summarized : # Only re-enable toggle if there is a summary
+             self.summary_mode_btn.setEnabled(True)
+
+
+        self.status_label.setText("章节修改已保存。")
+
+        # Explicitly call auto_save to persist the change to chapter content
+        # This is important because get_chapter_states now includes content
+        self.auto_save()
+
 
     def closeEvent(self, event):
         """程序关闭事件"""
