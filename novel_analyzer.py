@@ -201,6 +201,90 @@ class WorkerThread(QThread):
         self.running = False
 
 
+from PyQt5.QtWidgets import QDialog, QDialogButtonBox # Ensure QDialogButtonBox is imported
+
+class ManageModelsDialog(QDialog):
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self.setWindowTitle("管理自定义模型")
+        self.setMinimumSize(600, 400) # Set a reasonable minimum size
+
+        layout = QVBoxLayout(self)
+
+        self.models_list_widget = QTreeWidget()
+        self.models_list_widget.setHeaderLabels(["模型显示名称", "模型ID", "API 地址", "操作"])
+        self.models_list_widget.header().setSectionResizeMode(0, QTreeWidget.Stretch)
+        self.models_list_widget.header().setSectionResizeMode(2, QTreeWidget.Stretch)
+        layout.addWidget(self.models_list_widget)
+
+        self.populate_models_list()
+
+        # Close button
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.accept)
+
+        # Optional: Add a layout for buttons if more are added later
+        button_layout = QHBoxLayout()
+        button_layout.addStretch() # Push button to the right
+        button_layout.addWidget(close_button)
+        layout.addLayout(button_layout)
+
+        self.setLayout(layout)
+
+    def populate_models_list(self):
+        self.models_list_widget.clear()
+        for model_key, config_data in self.main_window.model_configs.items():
+            if model_key not in self.main_window.initial_model_keys:
+                display_name = config_data.get("display_name", model_key)
+                url = config_data.get("url", "N/A")
+
+                tree_item = QTreeWidgetItem(self.models_list_widget, [display_name, model_key, url])
+
+                remove_button = QPushButton("移除")
+                remove_button.setProperty("model_key_to_remove", model_key)
+                remove_button.clicked.connect(self.handle_remove_model)
+                self.models_list_widget.setItemWidget(tree_item, 3, remove_button)
+
+        # Adjust column widths after populating
+        self.models_list_widget.resizeColumnToContents(1) # Model ID
+        self.models_list_widget.resizeColumnToContents(3) # Action button
+
+    def handle_remove_model(self):
+        button = self.sender()
+        if not button:
+            return
+
+        model_key_to_remove = button.property("model_key_to_remove")
+        if not model_key_to_remove:
+            return
+
+        model_display_name = self.main_window.model_configs.get(model_key_to_remove, {}).get("display_name", model_key_to_remove)
+
+        reply = QMessageBox.question(self, '确认移除',
+                                     f"确定要移除自定义模型 '{model_display_name}' ({model_key_to_remove}) 吗？\n此操作无法撤销。",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+
+        if reply == QMessageBox.Yes:
+            if model_key_to_remove in self.main_window.model_configs:
+                del self.main_window.model_configs[model_key_to_remove]
+
+            combo = self.main_window.model_combo
+            for i in range(combo.count()):
+                if combo.itemData(i) == model_key_to_remove:
+                    if combo.currentIndex() == i:
+                        combo.setCurrentIndex(-1)
+                        self.main_window.api_url_input.clear()
+                        self.main_window.status_label.setText(f"活动模型 {model_display_name} 已移除。")
+                    combo.removeItem(i)
+                    break
+
+            self.populate_models_list() # Refresh the list in the dialog
+            # Consider adding a status message to MainWindow or a signal if direct save is needed
+            self.main_window.status_label.setText(f"自定义模型 {model_display_name} 已移除。")
+            # Auto-save will pick this up on next cycle or on close.
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -215,6 +299,12 @@ class MainWindow(QMainWindow):
         self.total_tokens = [0, 0]  # [input, output]
         self.default_export_path = ""
         self.custom_prompt = "提炼以下文本的核心要点，仅输出提炼后的内容，不要包含任何额外解释或与原文无关的文字。保留关键情节和人物关系，压缩至原文1%字数："
+
+        # For ETA calculation
+        self.batch_start_time = 0
+        self.chapters_to_process_total = 0
+        self.chapters_processed_count = 0
+        self.average_time_per_chapter = 0 # Simple moving average or overall average
 
         # 预定义的模型配置
         self.model_configs = {
@@ -300,6 +390,7 @@ class MainWindow(QMainWindow):
         }
 
         self.init_ui()
+        self.initial_model_keys = set(self.model_configs.keys()) # Store initial predefined model keys
         self.auto_save_timer = QTimer()  # 新增自动保存定时器
         self.auto_save_timer.timeout.connect(self.auto_save)
         self.auto_save_timer.start(30000)  # 30秒自动保存
@@ -449,6 +540,9 @@ class MainWindow(QMainWindow):
         self.token_label = QLabel("Token消耗: 输入 0 | 输出 0")
         status_layout.addWidget(self.token_label)
 
+        self.eta_label = QLabel("预计剩余时间: N/A") # ETA Label
+        status_layout.addWidget(self.eta_label)
+
         self.status_label = QLabel("就绪")
         status_layout.addWidget(self.status_label)
         main_layout.addLayout(status_layout)
@@ -466,8 +560,17 @@ class MainWindow(QMainWindow):
         add_model_action.triggered.connect(self.add_custom_model)
         model_menu.addAction(add_model_action)
 
+        self.manage_models_action = QAction('管理自定义模型', self)
+        self.manage_models_action.triggered.connect(self.open_manage_models_dialog)
+        model_menu.addAction(self.manage_models_action)
+
         main_widget.setLayout(main_layout)
         self.setCentralWidget(main_widget)
+
+    def open_manage_models_dialog(self):
+        # Definition of ManageModelsDialog will be added in the next step
+        dialog = ManageModelsDialog(self)
+        dialog.exec_()
 
     def on_model_changed(self):
         """当模型选择改变时更新API地址"""
@@ -785,17 +888,19 @@ class MainWindow(QMainWindow):
         """提炼所有章节"""
         if not self.validate_config():
             return
-            
-        # 收集所有未提炼的章节
-        root = self.chapter_tree.invisibleRootItem()
-        tasks = []
         
-        for i in range(root.childCount()):
-            volume = root.child(i)
-            for j in range(volume.childCount()):
-                chapter = volume.child(j)
-                if isinstance(chapter, ChapterTreeItem) and not chapter.is_summarized:
-                    tasks.append((chapter, ""))
+        book_item = self.chapter_tree.topLevelItem(0)
+        if not book_item:
+            QMessageBox.information(self, "提示", "没有加载任何书籍。")
+            return
+
+        tasks = []
+        for i in range(book_item.childCount()): # Volumes
+            vol_item = book_item.child(i)
+            for j in range(vol_item.childCount()): # Chapters
+                chapter_item = vol_item.child(j)
+                if isinstance(chapter_item, ChapterTreeItem) and not chapter_item.is_summarized:
+                    tasks.append((chapter_item, ""))
         
         if not tasks:
             QMessageBox.information(self, "提示", "没有需要提炼的章节")
@@ -841,16 +946,43 @@ class MainWindow(QMainWindow):
         """启动处理任务"""
         if self.worker_thread and self.worker_thread.isRunning():
             return
+
+        # Reset ETA and progress variables
+        self.chapters_to_process_total = self.work_queue.qsize() # Should be len(tasks) before putting them
+        if self.chapters_to_process_total == 0 : # Double check if tasks were indeed added
+             QMessageBox.information(self, "提示", "所有章节均已提炼。")
+             return
+        self.chapters_processed_count = 0
+        self.batch_start_time = time.time()
+        self.average_time_per_chapter = 30 # Initial guess, will be updated
+        self.eta_label.setText("预计剩余时间: 计算中...")
+        self.progress_bar.setValue(0) # Ensure progress bar is reset
             
         self.worker_thread = WorkerThread(self.work_queue, self.llm_processor)
         self.worker_thread.update_signal.connect(self.handle_update)
-        self.worker_thread.progress_signal.connect(self.update_progress)
+        self.worker_thread.progress_signal.connect(self.update_progress) # Connect new signal if using advanced ETA
         self.worker_thread.error_signal.connect(self.handle_error)
         self.worker_thread.finished.connect(self.processing_finished)
         
         self.worker_thread.start()
+
+        # Disable UI elements during processing
+        self.chapter_tree.setEnabled(False)
+        self.model_combo.setEnabled(False)
+        self.api_key_input.setEnabled(False)
+        self.api_url_input.setEnabled(False)
+        self.test_btn.setEnabled(False)
+        self.load_btn.setEnabled(False)
+        self.save_config_btn.setEnabled(False)
+        self.load_config_btn.setEnabled(False)
+        self.prompt_input.setEnabled(False)
         self.summarize_btn.setEnabled(False)
         self.summarize_all_btn.setEnabled(False)
+        self.edit_chapter_btn.setEnabled(False)
+        self.export_btn.setEnabled(False) # Disable export during processing
+        if hasattr(self, 'manage_models_action'): # Check if action exists
+            self.manage_models_action.setEnabled(False)
+
         self.stop_btn.setEnabled(True)
         self.status_label.setText("处理中...")
 
@@ -864,10 +996,48 @@ class MainWindow(QMainWindow):
 
     def processing_finished(self):
         """处理完成"""
+        # Re-enable UI elements after processing
+        self.chapter_tree.setEnabled(True)
+        self.model_combo.setEnabled(True)
+        self.api_key_input.setEnabled(True)
+        self.api_url_input.setEnabled(True)
+        self.test_btn.setEnabled(True)
+        self.load_btn.setEnabled(True)
+        self.save_config_btn.setEnabled(True)
+        self.load_config_btn.setEnabled(True)
+        self.prompt_input.setEnabled(True)
         self.summarize_btn.setEnabled(True)
         self.summarize_all_btn.setEnabled(True)
+        self.export_btn.setEnabled(True) # Re-enable export
+        # Edit button state depends on current selection, show_content will handle it if an item is selected
+        current_item = self.chapter_tree.currentItem()
+        if current_item and isinstance(current_item, ChapterTreeItem):
+            self.edit_chapter_btn.setEnabled(True)
+        else:
+            self.edit_chapter_btn.setEnabled(False)
+        if hasattr(self, 'manage_models_action'): # Check if action exists
+            self.manage_models_action.setEnabled(True)
+
         self.stop_btn.setEnabled(False)
-        self.status_label.setText("处理完成")
+
+        # Only show message if batch processing was actually started and completed
+        if self.chapters_to_process_total > 0:
+            final_message = f"批量提炼处理完毕。\n共处理章节数: {self.chapters_processed_count}"
+            if self.chapters_processed_count != self.chapters_to_process_total and self.worker_thread and not self.worker_thread.running: # Check if stopped early
+                 final_message += f" (总任务数: {self.chapters_to_process_total}, 处理被用户提前中止)"
+            elif self.chapters_processed_count != self.chapters_to_process_total:
+                 final_message += f" (总任务数: {self.chapters_to_process_total})"
+
+            QMessageBox.information(self, "批量提炼完成", final_message)
+            self.status_label.setText("批量提炼完成")
+        else: # If no tasks were run (e.g. summarize_selected or no unsummarized chapters)
+            self.status_label.setText("处理完成")
+
+        self.eta_label.setText("预计剩余时间: N/A")
+        # Reset chapter counts for next batch
+        self.chapters_to_process_total = 0
+        self.chapters_processed_count = 0
+
 
     def handle_update(self, update_type, data):
         """处理UI更新"""
@@ -896,8 +1066,27 @@ class MainWindow(QMainWindow):
             f"Token消耗: 输入 {self.total_tokens[0]} | 输出 {self.total_tokens[1]}"
         )
 
-        if count > 0:
-            self.progress_bar.setValue(self.progress_bar.value() + count)
+        self.chapters_processed_count += count
+        if self.chapters_to_process_total > 0:
+            self.progress_bar.setValue(self.chapters_processed_count) # Update progress bar
+
+            elapsed_time_total = time.time() - self.batch_start_time
+            if self.chapters_processed_count > 0:
+                self.average_time_per_chapter = elapsed_time_total / self.chapters_processed_count
+                remaining_chapters = self.chapters_to_process_total - self.chapters_processed_count
+                if remaining_chapters > 0 and self.average_time_per_chapter > 0.1: # Avoid division by zero or tiny averages
+                    eta_seconds = self.average_time_per_chapter * remaining_chapters
+                    self.eta_label.setText(f"预计剩余时间: {time.strftime('%H:%M:%S', time.gmtime(eta_seconds))}")
+                elif remaining_chapters == 0 :
+                     self.eta_label.setText("预计剩余时间: 完成")
+                else:
+                    self.eta_label.setText("预计剩余时间: 计算中...") # Or N/A if average is too low
+            else: # chapters_processed_count is 0 but total > 0 (start of processing)
+                 self.eta_label.setText("预计剩余时间: 计算中...")
+        else: # chapters_to_process_total is 0
+            self.progress_bar.setValue(0)
+            self.eta_label.setText("预计剩余时间: N/A")
+
 
     def export_results(self):
         """导出提炼结果"""
@@ -1140,7 +1329,9 @@ class MainWindow(QMainWindow):
             "api_url": self.api_url_input.text(),
             "api_key": self.api_key_input.text(),
             "export_path": self.default_export_path,
-            "custom_models": {k: v for k, v in self.model_configs.items() if k.startswith('custom_')}, # Save only custom models explicitly added by user
+            "user_custom_models": {
+                k: v for k, v in self.model_configs.items() if k not in self.initial_model_keys
+            },
             "book_data": { # Ensure all necessary book_data fields are saved
                 "title": self.book_data.get("title"),
                 "file_path": self.book_data.get("file_path"),
@@ -1193,14 +1384,27 @@ class MainWindow(QMainWindow):
                 with open("config.json", 'r', encoding='utf-8') as f:
                     config = json.load(f)
                 
-                # 加载自定义模型
-                if "custom_models" in config:
-                    self.model_configs.update(config["custom_models"])
-                    
-                    # 更新下拉框
-                    for model_key, model_config in config["custom_models"].items():
-                        self.model_combo.addItem(model_config["display_name"], model_key)
+                # Load user-defined custom models first
+                if "user_custom_models" in config:
+                    loaded_custom_models = config["user_custom_models"]
+                    if isinstance(loaded_custom_models, dict):
+                        for model_key, model_config_data in loaded_custom_models.items():
+                            # Add to self.model_configs if not already present (e.g. from initial set)
+                            if model_key not in self.model_configs:
+                                self.model_configs[model_key] = model_config_data
+                                # Add to combobox
+                                display_name = model_config_data.get("display_name", model_key)
+                                # Avoid adding duplicates to combobox if somehow it's already there
+                                if self.model_combo.findData(model_key) == -1:
+                                     self.model_combo.addItem(display_name, model_key)
                 
+                # Remove old "custom_models" key from config if it exists from a previous version
+                # This is to ensure clean transition.
+                if "custom_models" in config:
+                    # We don't need to do anything with it, just let it be ignored
+                    # as we now use "user_custom_models"
+                    pass
+
                 # 恢复配置
                 if config.get("model"):
                     # 查找对应的显示名称
