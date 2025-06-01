@@ -7,9 +7,18 @@ from performance_logger import PerformanceLogger
 
 class LLMProcessor:
     def __init__(self, api_config, custom_prompt_text=None):
-        self.api_url = api_config['url']
-        self.api_key = api_config['key']
-        self.model = api_config['model']
+        if not isinstance(api_config, dict):
+            raise ValueError("api_config must be a dictionary.")
+
+        self.api_url = api_config.get('url')
+        self.api_key = api_config.get('key')
+        self.model = api_config.get('model')
+
+        if not self.api_url or not self.model: # API key can sometimes be optional for local models
+            # Key presence is usually validated by UI (validate_config) before this point,
+            # but model and URL are essential for the processor.
+            raise ValueError("API URL and model name must be provided in api_config.")
+
         self.custom_prompt_for_processor = custom_prompt_text
         self.session = requests.Session()
         self.MAX_RETRIES = 3  # Max retries for API calls

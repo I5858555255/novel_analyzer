@@ -1,6 +1,7 @@
 # threading_utils.py
 import queue # For WorkerThread
 import time  # For WorkerThread and SummarizationTask (potentially)
+import threading # For get_ident() in debug print
 from PyQt5.QtCore import QObject, pyqtSignal, QRunnable, QThread
 
 # Moved from novel_analyzer.py (LLMProcessor also moved, ensure it's imported if needed by tasks, though tasks receive api_config)
@@ -15,6 +16,7 @@ class SummarizationSignals(QObject):
 class SummarizationTask(QRunnable):
     def __init__(self, chapter_item_identifier, chapter_content, chapter_context, api_config, custom_prompt_text, main_window_ref):
         super().__init__()
+        print(f"DEBUG: SummarizationTask.__init__ for identifier: {chapter_item_identifier}") # <<< ADD
         self.identifier = chapter_item_identifier
         self.content = chapter_content
         self.context = chapter_context
@@ -28,6 +30,7 @@ class SummarizationTask(QRunnable):
 
 
     def run(self):
+        print(f"DEBUG: SummarizationTask.run for identifier: {self.identifier} - Thread ID: {threading.get_ident()}") # <<< ADD
         # Check stop flag before doing significant work
         if self.main_window.stop_batch_requested:
             self.signals.error_signal.emit(self.identifier, "处理被用户中止")
@@ -35,7 +38,9 @@ class SummarizationTask(QRunnable):
             return
 
         # LLMProcessor is instantiated here, specific to this task
+        print(f"DEBUG: SummarizationTask.run - Instantiating LLMProcessor for: {self.identifier}") # <<< ADD
         processor = LLMProcessor(self.api_config, self.custom_prompt_for_processor)
+        print(f"DEBUG: SummarizationTask.run - LLMProcessor instantiated for: {self.identifier}") # <<< ADD
         summary_text = None # Ensure it's defined for the finally block
         try:
             # Another check before the actual API call
