@@ -9,16 +9,26 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QTreeWidget, QTreeWidget
                              QTextEdit, QFileDialog, QPushButton, QComboBox,
                              QProgressBar, QLabel, QSplitter, QVBoxLayout,
                              QHBoxLayout, QWidget, QAction, QMessageBox, QLineEdit)
-from PyQt5.QtCore import pyqtSignal, Qt, QThread, QTimer
+from PyQt5.QtCore import pyqtSignal, Qt, QThread, QTimer, QObject, QRunnable, QThreadPool # Added QRunnable, QThreadPool
 import requests
+
+class SummarizationSignals(QObject):
+    """
+    Defines signals for summarization tasks.
+    item_identifier will be a tuple like (volume_title, chapter_original_title)
+    """
+    update_signal = pyqtSignal(object, str) # item_identifier, summary_text
+    progress_signal = pyqtSignal(int, int, int)  # in_tokens, out_tokens, count
+    error_signal = pyqtSignal(object, str) # item_identifier, error_message
+    finished_signal = pyqtSignal(object) # item_identifier, emitted when a single task completes
 
 
 class LLMProcessor:
-    def __init__(self, api_config, main_window): # Added main_window
+    def __init__(self, api_config, custom_prompt_text=None): # Changed main_window to custom_prompt_text
         self.api_url = api_config['url']
         self.api_key = api_config['key']
         self.model = api_config['model']
-        self.main_window = main_window # Store main_window reference
+        self.custom_prompt_for_processor = custom_prompt_text
         
         # 安全地初始化tiktoken编码器
         try:
@@ -65,7 +75,10 @@ class LLMProcessor:
             time.sleep(1.0 - (current_time - self.last_call))
 
         # 构造提示词
-        prompt = f"{self.main_window.custom_prompt}\n{text}" if self.main_window.custom_prompt else f"作为专业编辑，请用原文语言提炼以下内容的核心要点（保留关键情节和人物关系，压缩至原文1%字数）：\n{text}"
+        default_prompt_template = "提炼以下文本的核心要点，仅输出提炼后的内容，不要包含任何额外解释或与原文无关的文字。保留关键情节和人物关系，压缩至原文1%字数："
+        effective_prompt_template = self.custom_prompt_for_processor if self.custom_prompt_for_processor else default_prompt_template
+        prompt = f"{effective_prompt_template}\n{text}"
+
         if context:
             prompt = f"上下文：{context}\n\n{prompt}"
 
@@ -201,6 +214,34 @@ class WorkerThread(QThread):
         self.running = False
 
 
+from PyQt5.QtCore import QRunnable # Ensure QRunnable is imported
+
+class SummarizationTask(QRunnable):
+    def __init__(self, chapter_item_identifier, chapter_content, chapter_context, api_config, custom_prompt_text):
+        super().__init__()
+        self.identifier = chapter_item_identifier
+        self.content = chapter_content
+        self.context = chapter_context
+        self.api_config = api_config
+        self.custom_prompt_for_processor = custom_prompt_text
+        self.signals = SummarizationSignals()
+
+    def run(self):
+        try:
+            processor = LLMProcessor(self.api_config, self.custom_prompt_for_processor)
+            summary_text, in_tokens, out_tokens = processor.summarize(self.content, self.context)
+
+            # Ensure summary_text is not None, default to empty string if it is
+            summary_text = summary_text if summary_text is not None else ""
+
+            self.signals.update_signal.emit(self.identifier, summary_text)
+            self.signals.progress_signal.emit(in_tokens, out_tokens, 1)
+        except Exception as e:
+            self.signals.error_signal.emit(self.identifier, str(e))
+        finally:
+            self.signals.finished_signal.emit(self.identifier)
+
+
 from PyQt5.QtWidgets import QDialog, QDialogButtonBox # Ensure QDialogButtonBox is imported
 
 class ManageModelsDialog(QDialog):
@@ -304,7 +345,16 @@ class MainWindow(QMainWindow):
         self.batch_start_time = 0
         self.chapters_to_process_total = 0
         self.chapters_processed_count = 0
-        self.average_time_per_chapter = 0 # Simple moving average or overall average
+        self.average_time_per_chapter = 0
+        self.processed_chapter_times = []
+
+        # For batch metrics
+        self.total_input_tokens_batch = 0
+        self.total_output_tokens_batch = 0
+
+        self.thread_pool = QThreadPool()
+        # self.thread_pool.setMaxThreadCount(4) # Optional: set max threads
+        self.active_batch_tasks = 0
 
         # 预定义的模型配置
         self.model_configs = {
@@ -540,8 +590,11 @@ class MainWindow(QMainWindow):
         self.token_label = QLabel("Token消耗: 输入 0 | 输出 0")
         status_layout.addWidget(self.token_label)
 
-        self.eta_label = QLabel("预计剩余时间: N/A") # ETA Label
+        self.eta_label = QLabel("预计剩余时间: N/A")
         status_layout.addWidget(self.eta_label)
+
+        self.metrics_label = QLabel("速率: N/A Chaps/Min, N/A Tokens/Sec") # Metrics Label
+        status_layout.addWidget(self.metrics_label)
 
         self.status_label = QLabel("就绪")
         status_layout.addWidget(self.status_label)
@@ -875,7 +928,7 @@ class MainWindow(QMainWindow):
                 "key": self.api_key_input.text().strip(),
                 "model": self.get_current_model_name()
             }
-            self.llm_processor = LLMProcessor(api_config, self) # Pass MainWindow instance
+            self.llm_processor = LLMProcessor(api_config, self.custom_prompt) # Pass custom_prompt text
             
             # 添加任务到队列
             self.work_queue.put((current, context))
@@ -894,37 +947,47 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "提示", "没有加载任何书籍。")
             return
 
-        tasks = []
+        tasks_to_run_data = []
         for i in range(book_item.childCount()): # Volumes
             vol_item = book_item.child(i)
             for j in range(vol_item.childCount()): # Chapters
                 chapter_item = vol_item.child(j)
                 if isinstance(chapter_item, ChapterTreeItem) and not chapter_item.is_summarized:
-                    tasks.append((chapter_item, ""))
+                    identifier = (vol_item.text(0), chapter_item.original_title)
+                    content = chapter_item.content
+                    # context = ... (build context if needed, for now empty)
+                    tasks_to_run_data.append({
+                        "identifier": identifier,
+                        "content": content,
+                        "context": ""
+                    })
         
-        if not tasks:
-            QMessageBox.information(self, "提示", "没有需要提炼的章节")
+        if not tasks_to_run_data:
+            QMessageBox.information(self, "提示", "没有需要提炼的章节。")
             return
             
-        # 初始化处理器
-        try:
-            api_config = {
-                "url": self.api_url_input.text().strip(),
-                "key": self.api_key_input.text().strip(),
-                "model": self.get_current_model_name()
-            }
-            self.llm_processor = LLMProcessor(api_config, self) # Pass MainWindow instance
+        api_config = {
+            "url": self.api_url_input.text().strip(),
+            "key": self.api_key_input.text().strip(),
+            "model": self.get_current_model_name()
+        }
+
+        self.start_batch_processing(len(tasks_to_run_data)) # Call new helper
+
+        for task_data in tasks_to_run_data:
+            runnable_task = SummarizationTask(
+                chapter_item_identifier=task_data["identifier"],
+                chapter_content=task_data["content"],
+                chapter_context=task_data["context"],
+                api_config=api_config,
+                custom_prompt_text=self.custom_prompt
+            )
+            runnable_task.signals.update_signal.connect(self.handle_chapter_summary_update)
+            runnable_task.signals.progress_signal.connect(self.update_batch_progress)
+            runnable_task.signals.error_signal.connect(self.handle_chapter_error)
+            runnable_task.signals.finished_signal.connect(self.handle_task_finished)
             
-            # 添加所有任务
-            for task in tasks:
-                self.work_queue.put(task)
-                
-            self.progress_bar.setMaximum(len(tasks))
-            self.progress_bar.setValue(0)
-            self.start_processing()
-            
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"初始化失败: {str(e)}")
+            self.thread_pool.start(runnable_task)
 
     def validate_config(self):
         """验证配置"""
@@ -945,28 +1008,19 @@ class MainWindow(QMainWindow):
     def start_processing(self):
         """启动处理任务"""
         if self.worker_thread and self.worker_thread.isRunning():
-            return
-
-        # Reset ETA and progress variables
-        self.chapters_to_process_total = self.work_queue.qsize() # Should be len(tasks) before putting them
-        if self.chapters_to_process_total == 0 : # Double check if tasks were indeed added
-             QMessageBox.information(self, "提示", "所有章节均已提炼。")
-             return
-        self.chapters_processed_count = 0
-        self.batch_start_time = time.time()
-        self.average_time_per_chapter = 30 # Initial guess, will be updated
-        self.eta_label.setText("预计剩余时间: 计算中...")
-        self.progress_bar.setValue(0) # Ensure progress bar is reset
+            return # Already processing or no tasks
             
-        self.worker_thread = WorkerThread(self.work_queue, self.llm_processor)
-        self.worker_thread.update_signal.connect(self.handle_update)
-        self.worker_thread.progress_signal.connect(self.update_progress) # Connect new signal if using advanced ETA
-        self.worker_thread.error_signal.connect(self.handle_error)
-        self.worker_thread.finished.connect(self.processing_finished)
+        # This method is for single chapter summarization using WorkerThread
+        # The batch processing logic is now in summarize_all and uses QThreadPool
+        self.worker_thread = WorkerThread(self.work_queue, self.llm_processor) # llm_processor should be set before this
+        self.worker_thread.update_signal.connect(self.handle_update) # Old signal for single tasks
+        self.worker_thread.progress_signal.connect(self.update_progress) # Old signal for single tasks
+        self.worker_thread.error_signal.connect(self.handle_error) # Can be reused or make specific
+        self.worker_thread.finished.connect(self.processing_finished) # Old finished for single tasks
         
         self.worker_thread.start()
 
-        # Disable UI elements during processing
+         # Disable UI elements during processing (common parts)
         self.chapter_tree.setEnabled(False)
         self.model_combo.setEnabled(False)
         self.api_key_input.setEnabled(False)
@@ -985,6 +1039,43 @@ class MainWindow(QMainWindow):
 
         self.stop_btn.setEnabled(True)
         self.status_label.setText("处理中...")
+
+    def start_batch_processing(self, total_tasks):
+        """Helper to initialize state for batch processing."""
+        self.active_batch_tasks = total_tasks
+        self.chapters_to_process_total = total_tasks
+        self.chapters_processed_count = 0
+        self.processed_chapter_times = []
+        self.batch_start_time = time.time()
+        self.average_time_per_chapter = 30 # Reset initial guess
+        self.total_input_tokens_batch = 0 # Reset batch token counters
+        self.total_output_tokens_batch = 0
+
+        self.progress_bar.setMaximum(total_tasks)
+        self.progress_bar.setValue(0)
+        self.eta_label.setText("预计剩余时间: 计算中...")
+        self.metrics_label.setText("速率: 计算中...") # Reset metrics label
+        self.status_label.setText(f"批量处理中... {total_tasks} 章节待处理")
+
+        # Disable UI elements
+        self.chapter_tree.setEnabled(False)
+        self.model_combo.setEnabled(False)
+        self.api_key_input.setEnabled(False)
+        self.api_url_input.setEnabled(False)
+        self.test_btn.setEnabled(False)
+        self.load_btn.setEnabled(False)
+        self.save_config_btn.setEnabled(False)
+        self.load_config_btn.setEnabled(False)
+        self.prompt_input.setEnabled(False)
+        self.summarize_btn.setEnabled(False)
+        self.summarize_all_btn.setEnabled(False)
+        self.edit_chapter_btn.setEnabled(False)
+        self.export_btn.setEnabled(False)
+        if hasattr(self, 'manage_models_action'):
+            self.manage_models_action.setEnabled(False)
+
+        self.stop_btn.setEnabled(True)
+
 
     def stop_processing(self):
         """停止处理"""
@@ -1034,9 +1125,11 @@ class MainWindow(QMainWindow):
             self.status_label.setText("处理完成")
 
         self.eta_label.setText("预计剩余时间: N/A")
-        # Reset chapter counts for next batch
+        # Reset chapter counts for next batch whether finished naturally or stopped
         self.chapters_to_process_total = 0
-        self.chapters_processed_count = 0
+        self.chapters_processed_count = 0 # Also reset for the specific batch count
+        self.active_batch_tasks = 0 # Ensure it's reset
+        self.metrics_label.setText("速率: N/A") # Reset metrics label
 
 
     def handle_update(self, update_type, data):
@@ -1059,33 +1152,103 @@ class MainWindow(QMainWindow):
         self.processing_finished()
 
     def update_progress(self, in_tokens, out_tokens, count):
-        """更新进度和Token统计"""
+        """Slot for progress from the old WorkerThread (single chapter processing)."""
         self.total_tokens[0] += in_tokens
         self.total_tokens[1] += out_tokens
         self.token_label.setText(
             f"Token消耗: 输入 {self.total_tokens[0]} | 输出 {self.total_tokens[1]}"
         )
+        # This progress bar update is for single chapter, might conflict if batch is also running
+        # For now, let's assume single chapter doesn't use the main progress bar in the same way
+        # or we can make self.progress_bar.setMaximum(1) in summarize_selected's start_processing.
+        if self.chapters_to_process_total <= 1: # Only update for single task from old worker
+            self.progress_bar.setValue(self.progress_bar.value() + count)
 
-        self.chapters_processed_count += count
-        if self.chapters_to_process_total > 0:
-            self.progress_bar.setValue(self.chapters_processed_count) # Update progress bar
 
-            elapsed_time_total = time.time() - self.batch_start_time
-            if self.chapters_processed_count > 0:
-                self.average_time_per_chapter = elapsed_time_total / self.chapters_processed_count
-                remaining_chapters = self.chapters_to_process_total - self.chapters_processed_count
-                if remaining_chapters > 0 and self.average_time_per_chapter > 0.1: # Avoid division by zero or tiny averages
-                    eta_seconds = self.average_time_per_chapter * remaining_chapters
-                    self.eta_label.setText(f"预计剩余时间: {time.strftime('%H:%M:%S', time.gmtime(eta_seconds))}")
-                elif remaining_chapters == 0 :
-                     self.eta_label.setText("预计剩余时间: 完成")
-                else:
-                    self.eta_label.setText("预计剩余时间: 计算中...") # Or N/A if average is too low
-            else: # chapters_processed_count is 0 but total > 0 (start of processing)
-                 self.eta_label.setText("预计剩余时间: 计算中...")
-        else: # chapters_to_process_total is 0
-            self.progress_bar.setValue(0)
+    def find_chapter_item_by_identifier(self, identifier):
+        """Finds a ChapterTreeItem by its identifier tuple (volume_title, chapter_original_title)."""
+        vol_title_to_find, chap_original_title_to_find = identifier
+        if self.chapter_tree.topLevelItemCount() == 0:
+            return None
+        book_item = self.chapter_tree.topLevelItem(0)
+        if not book_item:
+            return None
+
+        for i in range(book_item.childCount()): # Volumes
+            vol_item = book_item.child(i)
+            if vol_item.text(0) == vol_title_to_find:
+                for j in range(vol_item.childCount()): # Chapters
+                    chapter_item = vol_item.child(j)
+                    if isinstance(chapter_item, ChapterTreeItem) and chapter_item.original_title == chap_original_title_to_find:
+                        return chapter_item
+        return None
+
+    def handle_chapter_summary_update(self, identifier, summary_text):
+        item = self.find_chapter_item_by_identifier(identifier)
+        if item:
+            item.summary = summary_text
+            item.is_summarized = True
+            item.summary_timestamp = time.time()
+            item.update_display_text()
+            if item == self.chapter_tree.currentItem():
+                self.show_content(item)
+        else:
+            print(f"Warning: Could not find chapter item for identifier {identifier} to update summary.")
+
+    def update_batch_progress(self, in_tokens, out_tokens, count):
+        """Slot for progress signals from SummarizationTask (QThreadPool)."""
+        self.total_tokens[0] += in_tokens # Overall total tokens
+        self.total_tokens[1] += out_tokens
+        self.token_label.setText(
+            f"Token消耗: 输入 {self.total_tokens[0]} | 输出 {self.total_tokens[1]}"
+        )
+        # Accumulate for batch-specific metrics
+        self.total_input_tokens_batch += in_tokens
+        self.total_output_tokens_batch += out_tokens
+
+        # Progress bar and ETA are updated in handle_task_finished
+        pass
+
+    def handle_chapter_error(self, identifier, error_message):
+        vol_title, chap_title = identifier
+        error_msg_display = f"错误: 章节 {vol_title}/{chap_title} - {error_message}"
+        print(error_msg_display) # Log to console
+        # Optionally, append to a log display in UI or show a non-modal notification
+        # For now, just update status bar with the latest error
+        self.status_label.setText(error_msg_display[:100]) # Show truncated error in status bar
+
+    def handle_task_finished(self, identifier):
+        self.chapters_processed_count += 1
+        self.progress_bar.setValue(self.chapters_processed_count)
+
+        if self.chapters_to_process_total > 0 and self.chapters_processed_count > 0:
+            elapsed_time_total_seconds = time.time() - self.batch_start_time
+            self.average_time_per_chapter = elapsed_time_total_seconds / self.chapters_processed_count
+
+            remaining_chapters = self.chapters_to_process_total - self.chapters_processed_count
+            if remaining_chapters > 0 and self.average_time_per_chapter > 0.01: # Use a smaller threshold for average time
+                eta_seconds = self.average_time_per_chapter * remaining_chapters
+                self.eta_label.setText(f"预计剩余时间: {time.strftime('%H:%M:%S', time.gmtime(eta_seconds))}")
+            elif remaining_chapters == 0:
+                self.eta_label.setText("预计剩余时间: 完成")
+            else:
+                self.eta_label.setText("预计剩余时间: 计算中...") # Or when average_time is too small
+
+            # Calculate and display metrics
+            if elapsed_time_total_seconds > 0.1: # Avoid division by zero if tasks are extremely fast
+                chapters_per_minute = (self.chapters_processed_count / elapsed_time_total_seconds) * 60
+                total_tokens_processed_batch = self.total_input_tokens_batch + self.total_output_tokens_batch
+                tokens_per_second = total_tokens_processed_batch / elapsed_time_total_seconds
+                self.metrics_label.setText(f"速率: {chapters_per_minute:.2f} Chaps/Min, {tokens_per_second:.2f} Tokens/Sec")
+            else:
+                self.metrics_label.setText("速率: 计算中...")
+        else: # Should not happen if chapters_to_process_total > 0 initially
             self.eta_label.setText("预计剩余时间: N/A")
+            self.metrics_label.setText("速率: N/A")
+
+        self.active_batch_tasks -= 1
+        if self.active_batch_tasks <= 0: # Use <= 0 for safety
+            self.processing_finished()
 
 
     def export_results(self):
@@ -1339,7 +1502,7 @@ class MainWindow(QMainWindow):
                 "volumes": self.book_data.get("volumes", []) # Retain volumes if they exist
             },
             "summary_mode": self.summary_mode_btn.isChecked(),
-            "custom_prompt": self.custom_prompt_input.text(), # Get current prompt from input field
+            "custom_prompt": self.custom_prompt, # Use instance variable
             "chapter_states": self.get_chapter_states()
         }
         
@@ -1499,22 +1662,35 @@ class MainWindow(QMainWindow):
                            (chapter_item.original_title == chap_title_from_state or
                             (not hasattr(chapter_item, 'original_title') and chapter_item.text(0) == chap_title_from_state)): # Fallback for older items
 
+                            if not isinstance(state, dict):
+                                print(f"Warning: Invalid state format for chapter '{chap_title_from_state}'. Skipping state restoration for this chapter.")
+                                continue # Skip to the next chapter_item in the tree or next state
+
                             chapter_item.is_summarized = state.get("is_summarized", False)
-                            chapter_item.summary = state.get("summary", "")
-                            chapter_item.summary_timestamp = state.get("timestamp", 0)
 
-                            if "content" in state:
-                                chapter_item.content = state["content"]
-                            if "word_count" in state:
-                                chapter_item.word_count = state["word_count"]
-                                chapter_item.setText(1, f"{chapter_item.word_count}字")
-                            else: # Recalculate if not present
+                            loaded_summary = state.get("summary", "")
+                            chapter_item.summary = loaded_summary if isinstance(loaded_summary, str) else ""
+
+                            loaded_timestamp = state.get("timestamp", 0)
+                            chapter_item.summary_timestamp = loaded_timestamp if isinstance(loaded_timestamp, (int, float)) else 0
+
+                            loaded_content = state.get("content")
+                            if isinstance(loaded_content, str):
+                                chapter_item.content = loaded_content
+                            # Else: keep existing chap.content (from initial parse or constructor)
+
+                            loaded_word_count = state.get("word_count")
+                            if isinstance(loaded_word_count, int):
+                                chapter_item.word_count = loaded_word_count
+                            else: # Recalculate if not valid or not present
                                 chapter_item.word_count = len(chapter_item.content)
-                                chapter_item.setText(1, f"{chapter_item.word_count}字")
 
+                            chapter_item.setText(1, f"{chapter_item.word_count}字")
                             chapter_item.update_display_text()
-                            break # Found chapter, move to next state
-                    break # Found volume, move to next state
+                            break # Found chapter, move to next state in states list
+                    if chapter_item.original_title == chap_title_from_state : break # Chapter found and processed
+            if vol_item.text(0) == vol_title: break # Volume found and all its chapters processed for this state
+
 
     def update_prompt(self):
         """更新自定义提示词"""
@@ -1535,7 +1711,7 @@ class MainWindow(QMainWindow):
             # 创建处理器并测试
             # For test_connection, we might not have a fully initialized LLMProcessor instance member yet,
             # so create a local one and pass 'self' (MainWindow) for custom_prompt access.
-            processor = LLMProcessor(api_config, self) # Pass MainWindow instance
+            processor = LLMProcessor(api_config, self.custom_prompt) # Pass custom_prompt text
             test_text = "这是一个连接测试。"
             
             self.status_label.setText("正在测试连接...")
