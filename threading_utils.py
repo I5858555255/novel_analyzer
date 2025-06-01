@@ -13,7 +13,7 @@ class SummarizationSignals(QObject):
     finished_signal = pyqtSignal(object) # identifier
 
 class SummarizationTask(QRunnable):
-    def __init__(self, chapter_item_identifier, chapter_content, chapter_context, api_config, custom_prompt_text):
+    def __init__(self, chapter_item_identifier, chapter_content, chapter_context, api_config, custom_prompt_text, main_window_ref):
         super().__init__()
         self.identifier = chapter_item_identifier
         self.content = chapter_content
@@ -21,20 +21,37 @@ class SummarizationTask(QRunnable):
         self.api_config = api_config
         self.custom_prompt_for_processor = custom_prompt_text
         self.signals = SummarizationSignals()
+        self.main_window = main_window_ref # Store reference to MainWindow
 
         # This import needs to be here if llm_processor.py is a separate file
-        # Or, LLMProcessor class could be passed in if it's small and self-contained enough
-        # For now, direct import is fine as it's refactored.
         from llm_processor import LLMProcessor
 
 
     def run(self):
+        # Check stop flag before doing significant work
+        if self.main_window.stop_batch_requested:
+            self.signals.error_signal.emit(self.identifier, "处理被用户中止")
+            self.signals.finished_signal.emit(self.identifier) # Still signal finished
+            return
+
         # LLMProcessor is instantiated here, specific to this task
         processor = LLMProcessor(self.api_config, self.custom_prompt_for_processor)
         summary_text = None # Ensure it's defined for the finally block
         try:
+            # Another check before the actual API call
+            if self.main_window.stop_batch_requested:
+                self.signals.error_signal.emit(self.identifier, "处理被用户中止")
+                self.signals.finished_signal.emit(self.identifier)
+                return
+
             summary_text, in_tokens, out_tokens = processor.summarize(self.content, self.context)
-            if summary_text is not None: # Check if summary_text is not None before emitting
+
+            if self.main_window.stop_batch_requested: # Check immediately after potentially long call
+                self.signals.error_signal.emit(self.identifier, "处理完成但已被用户中止")
+                self.signals.finished_signal.emit(self.identifier)
+                return
+
+            if summary_text is not None:
                  self.signals.update_signal.emit(self.identifier, summary_text)
             # progress_signal is for overall batch, tokens are summed up in main window
             # However, individual task token usage can be emitted if needed,
