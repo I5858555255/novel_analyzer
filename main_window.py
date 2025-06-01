@@ -72,6 +72,7 @@ class MainWindow(QMainWindow):
         self.total_input_tokens_batch = 0
         self.total_output_tokens_batch = 0
         self.average_time_per_chapter = 0
+        self.stop_batch_requested = False # Initialize stop flag
 
 
         self.init_ui()
@@ -197,13 +198,14 @@ class MainWindow(QMainWindow):
         file_menu.addAction(export_action)
 
         model_menu = menubar.addMenu('模型管理')
-        add_model_action = QAction('添加自定义模型', self)
-        add_model_action.triggered.connect(self.add_custom_model) # Keep this for now, or change to open_manage_models_dialog
-        model_menu.addAction(add_model_action)
+        # Store actions as instance variables if they need to be accessed later (e.g., to disable/enable)
+        self.add_model_action = QAction('添加自定义模型', self)
+        self.add_model_action.triggered.connect(self.add_custom_model)
+        model_menu.addAction(self.add_model_action)
 
-        manage_models_action = QAction("管理自定义模型", self)
-        manage_models_action.triggered.connect(self.open_manage_models_dialog)
-        model_menu.addAction(manage_models_action)
+        self.manage_models_action = QAction("管理自定义模型", self)
+        self.manage_models_action.triggered.connect(self.open_manage_models_dialog)
+        model_menu.addAction(self.manage_models_action)
 
         main_widget.setLayout(main_layout)
         self.setCentralWidget(main_widget)
@@ -372,11 +374,88 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"初始化失败: {str(e)}")
 
-    def summarize_all(self): # Placeholder for QThreadPool refactor
-        QMessageBox.information(self, "提示", "一键提炼功能正在使用新的线程模型重构，请稍后。")
-        return
-        # The old WorkerThread based logic for summarize_all is now fully removed
-        # It will be replaced by QThreadPool logic in a subsequent step.
+    def summarize_all(self):
+        if not self.book_data.get("title") or self.chapter_tree.topLevelItemCount() == 0:
+            QMessageBox.information(self, "提示", "请先导入小说。")
+            return
+
+        if not self.validate_config(): # Checks API key, URL, model selection
+            return
+
+        book_item = self.chapter_tree.topLevelItem(0)
+        if not book_item:
+            QMessageBox.information(self, "提示", "书籍未正确加载到章节树。")
+            return
+
+        tasks_to_run_data = []
+        for i in range(book_item.childCount()):  # Iterate through volumes
+            vol_item = book_item.child(i)
+            for j in range(vol_item.childCount()):  # Iterate through chapters
+                chapter_item = vol_item.child(j)
+                if isinstance(chapter_item, ChapterTreeItem) and not chapter_item.is_summarized:
+                    identifier = (vol_item.text(0), chapter_item.original_title) # Corrected identifier
+                    content = chapter_item.content
+                    current_context = ""
+                    tasks_to_run_data.append({
+                        "identifier": identifier,
+                        "content": content,
+                        "context": current_context
+                    })
+
+        if not tasks_to_run_data:
+            QMessageBox.information(self, "提示", "所有章节均已提炼或没有章节可供提炼。")
+            return
+
+        try:
+            api_config = {
+                "url": self.api_url_input.text().strip(),
+                "key": self.api_key_input.text().strip(),
+                "model": self.get_current_model_name()
+            }
+            # Optional: Validate LLMProcessor creation here, though SummarizationTask will do it too
+            # _ = LLMProcessor(api_config, self.custom_prompt)
+        except Exception as e:
+            QMessageBox.critical(self, "配置错误", f"API配置无效: {str(e)}")
+            return
+
+        self.start_batch_processing(len(tasks_to_run_data))
+
+        for task_data in tasks_to_run_data:
+            if self.stop_batch_requested:
+                self.status_label.setText("批量处理已由用户中止。")
+                # If stop was requested before any tasks could be processed by the thread pool,
+                # we might need to call processing_finished here to reset the UI.
+                # The check in handle_task_finished (active_batch_tasks == 0) handles cases where tasks ran.
+                # This handles the case where the loop creating tasks is exited early.
+                if self.active_batch_tasks > 0 and self.chapters_processed_count == 0 :
+                     # This implies tasks were queued but stop was hit before any finished to call processing_finished
+                     # However, handle_task_finished will eventually be called for each task, even if it errors out due to stop.
+                     # The critical part is that tasks should not start if stop_batch_requested is true.
+                     # The logic in SummarizationTask.run() handles this for tasks not yet started by the pool.
+                     pass # Let handle_task_finished manage the final processing_finished call.
+                elif self.active_batch_tasks == 0 : # No tasks were even put to thread pool effectively
+                    self.processing_finished(stopped_by_user=True)
+                break
+
+            runnable_task = SummarizationTask(
+                chapter_item_identifier=task_data["identifier"],
+                chapter_content=task_data["content"],
+                chapter_context=task_data["context"],
+                api_config=api_config,
+                custom_prompt_text=self.custom_prompt,
+                main_window_ref=self # Pass reference to MainWindow
+            )
+
+            runnable_task.signals.update_signal.connect(self.handle_chapter_summary_update)
+            runnable_task.signals.progress_signal.connect(self.update_batch_progress)
+            runnable_task.signals.error_signal.connect(self.handle_chapter_error)
+            runnable_task.signals.finished_signal.connect(self.handle_task_finished)
+
+            self.thread_pool.start(runnable_task)
+
+        if self.stop_batch_requested and self.active_batch_tasks == 0 and self.chapters_processed_count == 0 :
+            # This case handles if stop was requested, loop broke, and no tasks effectively ran or started to decrement active_batch_tasks
+            self.processing_finished()
 
     def validate_config(self):
         if not self.api_url_input.text().strip():
@@ -391,24 +470,85 @@ class MainWindow(QMainWindow):
         pass
 
     def stop_processing(self):
-        if self.worker_thread and self.worker_thread.isRunning(): # For old WorkerThread
-            self.worker_thread.stop()
-            self.worker_thread.wait(3000)
-        # Add logic here to stop QThreadPool tasks if implemented for summarize_all
-        # For now, this only affects summarize_selected
-        self.processing_finished() # Reset UI elements
+        print("Stop processing requested by user.")
+        self.stop_batch_requested = True
 
-    def processing_finished(self): # Called by WorkerThread or QThreadPool completion logic
+        # For WorkerThread (single chapter processing)
+        if self.worker_thread and self.worker_thread.isRunning():
+            self.worker_thread.stop() # This sets worker_thread.running = False
+            # WorkerThread's run loop will break, and its finished signal will call processing_finished.
+            # We don't call processing_finished(stopped_by_user=True) directly here for WorkerThread
+            # as its own finish mechanism handles it.
+
+        # For QThreadPool tasks:
+        # QThreadPool.clear() is an option but prevents tasks from reporting status.
+        # The cooperative cancellation (SummarizationTask checking self.main_window.stop_batch_requested)
+        # is the primary mechanism.
+        # If tasks are very short or already finished, this flag might not be checked by all.
+        # The main effect is to prevent new tasks from starting work and to update UI appropriately.
+
+        self.status_label.setText("停止请求已发送... 等待当前活动任务完成或中止。")
+        self.stop_btn.setEnabled(False)
+
+        # If no tasks are active (e.g., stop clicked before summarize_all really starts queueing,
+        # or after summarize_selected's worker already finished but before UI reset by its own signal),
+        # and the flag made summarize_all exit its loop early.
+        if self.active_batch_tasks == 0 and not (self.worker_thread and self.worker_thread.isRunning()):
+             if self.chapters_to_process_total > 0 and self.chapters_processed_count < self.chapters_to_process_total :
+                  print("No active tasks found or all tasks were prevented from starting by stop request.")
+                  self.processing_finished(stopped_by_user=True)
+             elif self.chapters_to_process_total == 0 and self.chapters_processed_count == 0: # Nothing was ever started
+                  self.processing_finished(stopped_by_user=True) # Reset UI correctly
+
+    def processing_finished(self, stopped_by_user=False): # Add parameter
         self.summarize_btn.setEnabled(True)
         self.summarize_all_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        self.status_label.setText("处理完成")
-        # Reset progress for next operation (WorkerThread doesn't manage batch progress)
+        self.stop_btn.setEnabled(False) # Always disable stop button when processing is done/stopped
+
+        if stopped_by_user or (self.chapters_to_process_total > 0 and self.chapters_processed_count < self.chapters_to_process_total and self.active_batch_tasks == 0):
+            final_message = f"批量处理已停止。\n共处理章节数: {self.chapters_processed_count} / {self.chapters_to_process_total}"
+            self.status_label.setText(f"批量处理已停止。已处理 {self.chapters_processed_count} / {self.chapters_to_process_total}")
+        elif self.chapters_to_process_total > 0 : # Batch processing finished normally
+            final_message = f"批量提炼处理完毕。\n共处理章节数: {self.chapters_processed_count}"
+            self.status_label.setText("批量提炼完成")
+        else: # For single chapter processing or if no batch was ever started
+            final_message = "处理完成。" # Generic message
+            self.status_label.setText("处理完成")
+
+        # Only show popup if a batch operation was attempted or if it's not a silent stop of a single task
+        if self.chapters_to_process_total > 0 or not stopped_by_user : # If a batch was started, or if single task finished normally
+             if not (stopped_by_user and self.chapters_to_process_total == 0): # Avoid popup if stop was clicked with no batch active
+                QMessageBox.information(self, "处理结束", final_message)
+
         self.progress_bar.setValue(0)
-        # For QThreadPool, reset batch-specific counters here too
-        self.active_batch_tasks = 0
-        self.eta_label.setText("")
-        self.metrics_label.setText("")
+        self.eta_label.setText("预计剩余时间: N/A")
+        self.metrics_label.setText("速率: N/A")
+
+        # Reset counters for the next potential batch
+        self.chapters_to_process_total = 0
+        # self.chapters_processed_count = 0 # Resetting this here might be too early if called by single worker thread before batch counts are summed up
+        # self.active_batch_tasks = 0 # Resetting this here might be too early
+        self.stop_batch_requested = False
+
+        # Re-enable UI elements
+        self.chapter_tree.setEnabled(True)
+        self.model_combo.setEnabled(True)
+        self.api_key_input.setEnabled(True)
+        self.api_url_input.setEnabled(True)
+        self.test_btn.setEnabled(True)
+        self.load_btn.setEnabled(True)
+        self.save_config_btn.setEnabled(True)
+        self.load_config_btn.setEnabled(True)
+        self.prompt_input.setEnabled(True)
+        self.export_btn.setEnabled(True)
+
+        if hasattr(self, 'edit_chapter_btn') and self.edit_chapter_btn: # Check if attribute exists
+            self.edit_chapter_btn.setEnabled(True)
+
+        if hasattr(self, 'add_model_action') and self.add_model_action:
+            self.add_model_action.setEnabled(True)
+        if hasattr(self, 'manage_models_action') and self.manage_models_action:
+            self.manage_models_action.setEnabled(True)
 
 
     def handle_update(self, update_type, data): # For WorkerThread
@@ -468,27 +608,91 @@ class MainWindow(QMainWindow):
         if self.active_batch_tasks == 0:
             self.total_tokens[0] += self.total_input_tokens_batch
             self.total_tokens[1] += self.total_output_tokens_batch
-            self.token_label.setText(f"Token消耗: 输入 {self.total_tokens[0]} | 输出 {self.total_tokens[1]}")
-            self.processing_finished() # Generic UI reset
-            QMessageBox.information(self, "完成", "所有章节处理完毕。")
-            self.eta_label.setText("全部完成")
+            # self.token_label is updated by update_batch_progress, final sum is good
+            self.processing_finished(stopped_by_user=self.stop_batch_requested)
+            # QMessageBox.information(self, "完成", "所有章节处理完毕。") # Message is now part of processing_finished
+            # self.eta_label.setText("全部完成") # Also handled by processing_finished
 
     def find_chapter_item_by_identifier(self, identifier):
-        # Identifier could be the original_title or a tuple (vol_title, chap_title)
-        # This needs to be robust. For now, assuming identifier is unique original_title.
-        root = self.chapter_tree.invisibleRootItem()
-        for i in range(root.childCount()):
-            vol_item = root.child(i)
-            for j in range(vol_item.childCount()):
-                chap_item = vol_item.child(j)
-                if isinstance(chap_item, ChapterTreeItem) and chap_item.original_title == identifier:
-                    return chap_item
+        if not isinstance(identifier, tuple) or len(identifier) != 2:
+            print(f"Warning: Invalid identifier format received by find_chapter_item_by_identifier: {identifier}")
+            return None
+
+        target_vol_title, target_chap_original_title = identifier
+
+        if self.chapter_tree.topLevelItemCount() == 0:
+            # print("Tree is empty, cannot find item.")
+            return None
+
+        book_item = self.chapter_tree.topLevelItem(0)
+        if not book_item:
+            # print("Book item not found.")
+            return None
+
+        for i in range(book_item.childCount()):  # Iterate through volumes
+            vol_item = book_item.child(i)
+            # Compare volume title (text in column 0)
+            if vol_item.text(0) == target_vol_title:
+                for j in range(vol_item.childCount()):  # Iterate through chapters in this volume
+                    chapter_item = vol_item.child(j)
+                    if isinstance(chapter_item, ChapterTreeItem) and \
+                       hasattr(chapter_item, 'original_title') and \
+                       chapter_item.original_title == target_chap_original_title:
+                        return chapter_item
+                # If volume found, but chapter not found within it, no need to search other volumes
+                # as the (volume_title, chapter_original_title) pair is assumed to be unique.
+                return None
+        # print(f"Chapter not found with identifier: {identifier}")
         return None
 
 
     def handle_error(self, error_msg): # For old WorkerThread
         QMessageBox.critical(self, "处理错误", error_msg)
         self.processing_finished()
+
+    def start_batch_processing(self, total_tasks):
+        self.active_batch_tasks = total_tasks
+        self.chapters_to_process_total = total_tasks
+        self.chapters_processed_count = 0
+        self.total_input_tokens_batch = 0
+        self.total_output_tokens_batch = 0
+        self.batch_start_time = time.time()
+        self.average_time_per_chapter = 0 # Or a default like 30
+
+        self.progress_bar.setMaximum(total_tasks)
+        self.progress_bar.setValue(0)
+
+        self.eta_label.setText("预计剩余时间: 计算中...")
+        self.metrics_label.setText("速率: 计算中...")
+        self.status_label.setText(f"批量处理中... {total_tasks}章节待处理")
+
+        self.stop_batch_requested = False
+
+        # Disable UI elements
+        self.chapter_tree.setEnabled(False)
+        self.model_combo.setEnabled(False)
+        self.api_key_input.setEnabled(False)
+        self.api_url_input.setEnabled(False)
+        self.test_btn.setEnabled(False)
+        self.load_btn.setEnabled(False)
+        self.save_config_btn.setEnabled(False)
+        self.load_config_btn.setEnabled(False)
+        self.prompt_input.setEnabled(False)
+        self.export_btn.setEnabled(False)
+
+        if hasattr(self, 'edit_chapter_btn') and self.edit_chapter_btn: # Check if attribute exists
+            self.edit_chapter_btn.setEnabled(False)
+
+        if hasattr(self, 'add_model_action') and self.add_model_action:
+            self.add_model_action.setEnabled(False)
+        if hasattr(self, 'manage_models_action') and self.manage_models_action:
+            self.manage_models_action.setEnabled(False)
+
+        # Control processing buttons
+        self.summarize_btn.setEnabled(False)
+        self.summarize_all_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+
 
     def update_progress(self, in_tokens, out_tokens, count): # For old WorkerThread
         self.total_tokens[0] += in_tokens
