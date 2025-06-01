@@ -282,23 +282,42 @@ class MainWindow(QMainWindow):
         return chapters
 
     def build_chapter_tree(self, chapters):
-        self.chapter_tree.clear()
-        root_title = self.book_data.get("title", "未命名书籍")
-        root = QTreeWidgetItem(self.chapter_tree, [root_title, ""])
-        root.setExpanded(True)
-        total_chapters = 0
-        total_words = 0
-        for volume_data in chapters:
-            vol_words = sum(c['word_count'] for c in volume_data['chapters'])
-            vol_item = QTreeWidgetItem(root, [volume_data['title'], f"{len(volume_data['chapters'])}章, {vol_words}字"])
-            vol_item.setExpanded(True)
-            for chapter_data in volume_data['chapters']:
-                chapter_item = ChapterTreeItem(chapter_data['title'], chapter_data['content'], chapter_data['word_count'], vol_item)
-                chapter_item.update_display_text()
-                total_chapters += 1
-            total_words += vol_words
-        root.setText(1, f"{len(chapters)}卷, {total_chapters}章, {total_words}字")
-        self.chapter_tree.expandAll()
+        print(f"DEBUG: Entering MainWindow.build_chapter_tree (processing {len(chapters)} volumes/groups)")
+        self.chapter_tree.setUpdatesEnabled(False) # <<< ADDED: Disable updates
+        try:
+            self.chapter_tree.clear()
+            root_title = self.book_data.get("title", "未命名书籍")
+            root = QTreeWidgetItem(self.chapter_tree, [root_title, ""])
+            # root.setExpanded(True) # Defer expanding
+
+            total_chapters = 0
+            total_words = 0
+            for volume_data in chapters:
+                vol_words = sum(c['word_count'] for c in volume_data['chapters'])
+                vol_item = QTreeWidgetItem(root, [volume_data['title'], f"{len(volume_data['chapters'])}章, {vol_words}字"])
+                # vol_item.setExpanded(True) # Defer expanding
+
+                for chapter_data in volume_data['chapters']:
+                    chapter_item = ChapterTreeItem(
+                        chapter_data['title'],
+                        chapter_data['content'],
+                        chapter_data['word_count'],
+                        vol_item
+                    )
+                    # print(f"DEBUG: MainWindow.build_chapter_tree - created ChapterTreeItem: {chapter_data['title']}") # Optional debug print
+                    chapter_item.update_display_text()
+                    total_chapters += 1
+                total_words += vol_words
+
+            root.setText(1, f"{len(chapters)}卷, {total_chapters}章, {total_words}字")
+
+            # Expand items after all are added
+            root.setExpanded(True)
+            for i in range(root.childCount()):
+                root.child(i).setExpanded(True)
+        finally:
+            self.chapter_tree.setUpdatesEnabled(True) # <<< ADDED: Re-enable updates
+            print("DEBUG: Exiting MainWindow.build_chapter_tree")
 
     def show_content(self, item):
         if isinstance(item, ChapterTreeItem):
@@ -901,29 +920,41 @@ class MainWindow(QMainWindow):
             return False
 
     def restore_chapter_states(self, states):
-        if self.chapter_tree.topLevelItemCount() == 0: return
+        print(f"DEBUG: Entering MainWindow.restore_chapter_states (processing {len(states)} states)")
+        if self.chapter_tree.topLevelItemCount() == 0:
+            print("DEBUG: MainWindow.restore_chapter_states - Chapter tree is empty, exiting.") # Corrected from previous attempt
+            return
         book_item = self.chapter_tree.topLevelItem(0)
-        if not book_item: return
-        for state_data in states:
-            if not isinstance(state_data, dict): continue
-            path_info = state_data.get("path")
-            if not isinstance(path_info, list) or len(path_info) != 2: continue
-            vol_title, chap_title = path_info
-            for i in range(book_item.childCount()):
-                vol_item = book_item.child(i)
-                if vol_item.text(0) == vol_title:
-                    for j in range(vol_item.childCount()):
-                        chap_item = vol_item.child(j)
-                        if isinstance(chap_item, ChapterTreeItem) and chap_item.original_title == chap_title:
-                            chap_item.is_summarized = state_data.get("is_summarized", False)
-                            chap_item.summary = state_data.get("summary", "")
-                            chap_item.summary_timestamp = float(state_data.get("timestamp", 0))
-                            chap_item.content = state_data.get("content", chap_item.content)
-                            chap_item.word_count = state_data.get("word_count", len(chap_item.content))
-                            chap_item.setText(1, f"{chap_item.word_count}字")
-                            chap_item.update_display_text()
-                            break
-                    break
+        if not book_item:
+            print("DEBUG: MainWindow.restore_chapter_states - Book item not found, exiting.") # Corrected from previous attempt
+            return
+
+        self.chapter_tree.setUpdatesEnabled(False) # <<< ADDED: Disable updates
+        try:
+            for state_data in states:
+                if not isinstance(state_data, dict): continue
+                path_info = state_data.get("path")
+                if not isinstance(path_info, list) or len(path_info) != 2: continue
+                vol_title, chap_title = path_info
+                for i in range(book_item.childCount()):
+                    vol_item = book_item.child(i)
+                    if vol_item.text(0) == vol_title:
+                        for j in range(vol_item.childCount()):
+                            chap_item = vol_item.child(j)
+                            if isinstance(chap_item, ChapterTreeItem) and chap_item.original_title == chap_title:
+                                # print(f"DEBUG: MainWindow.restore_chapter_states - restoring state for: {chap_title}") # Optional debug print
+                                chap_item.is_summarized = state_data.get("is_summarized", False)
+                                chap_item.summary = state_data.get("summary", "")
+                                chap_item.summary_timestamp = float(state_data.get("timestamp", 0))
+                                chap_item.content = state_data.get("content", chap_item.content)
+                                chap_item.word_count = state_data.get("word_count", len(chap_item.content))
+                                chap_item.setText(1, f"{chap_item.word_count}字")
+                                chap_item.update_display_text()
+                                break
+                        break
+        finally:
+            self.chapter_tree.setUpdatesEnabled(True) # <<< ADDED: Re-enable updates
+            print("DEBUG: Exiting MainWindow.restore_chapter_states")
 
     def update_prompt(self):
         self.custom_prompt = self.prompt_input.text()

@@ -26,6 +26,7 @@ class LLMProcessor:
         self.perf_logger = PerformanceLogger() # Get the singleton instance
 
         # 安全地初始化tiktoken编码器
+        print(f"DEBUG: LLMProcessor.__init__ - model: {self.model} - Attempting tiktoken init")
         try:
             model_name = self.model.split('/')[-1].lower()
             encoding_map = {
@@ -39,12 +40,15 @@ class LLMProcessor:
             }
             try:
                 self.encoding = tiktoken.encoding_for_model(model_name)
+                print(f"DEBUG: LLMProcessor.__init__ - tiktoken.encoding_for_model succeeded for {model_name}")
             except KeyError:
                 encoding_name = encoding_map.get(model_name.split('-')[0], 'cl100k_base')
                 self.encoding = tiktoken.get_encoding(encoding_name)
+                print(f"DEBUG: LLMProcessor.__init__ - tiktoken.get_encoding succeeded for {encoding_name}")
         except Exception as e:
-            print(f"LLMProcessor Tiktoken encoder initialization warning: {e}, using default cl100k_base encoder")
+            print(f"DEBUG: LLMProcessor.__init__ - tiktoken EXCEPTION: {e}, using default cl100k_base encoder")
             self.encoding = tiktoken.get_encoding('cl100k_base')
+        print(f"DEBUG: LLMProcessor.__init__ - tiktoken setup complete")
 
         self.last_call = 0
 
