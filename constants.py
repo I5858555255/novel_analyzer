@@ -68,6 +68,27 @@ DEFAULT_MODEL_CONFIGS = {
         "url": "https://api.anthropic.com/v1/messages",
         "display_name": "Claude 3 Sonnet"
     },
+
+    # Example for a Mistral model via an OpenAI-compatible endpoint
+    "mistral-7b-instruct-openai-compat": {
+        "url": "YOUR_OPENAI_COMPATIBLE_ENDPOINT_HERE/v1/chat/completions", # User needs to fill this
+        "display_name": "Mistral-7B Instruct (OpenAI Compat)"
+    },
+
+    # Example for local Ollama setup (OpenAI-compatible endpoint)
+    "ollama-local-model": {
+        "url": "http://localhost:11434/v1/chat/completions", # Default Ollama OpenAI-compatible endpoint
+        "display_name": "Ollama Local Model (e.g., Llama3)"
+        # User would specify the actual model name string in the UI when selecting this
+        # or the 'model' field in API call needs to be set to what Ollama expects e.g. "llama3"
+        # For simplicity in DEFAULT_MODEL_CONFIGS, we assume the 'model' parameter in the API call
+        # will be taken from the model_combo.currentText() or currentData() which is the key here.
+        # So, the user would select "ollama-local-model" and the request would send "model": "ollama-local-model".
+        # This might need adjustment in LLMProcessor or how model names are handled if the API expects
+        # a different 'model' field value than the key used in our combobox.
+        # For now, keeping it simple. User can use "Custom Model" for more complex cases.
+    },
+
     # 自定义模型 (Placeholder)
     "custom": {
         "url": "",
