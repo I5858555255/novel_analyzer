@@ -44,6 +44,27 @@ class MainWindow(QMainWindow):
 
         # For batch processing with QThreadPool (setup for future refactor of summarize_all)
         self.thread_pool = QThreadPool()
+        # Set a reasonable default max thread count for I/O bound tasks
+        # os.cpu_count() might be None, so provide a fallback.
+        # Let's aim for a number that provides good concurrency without being excessive.
+        # Python's ThreadPoolExecutor default is min(32, os.cpu_count() + 4)
+        # For GUI app with network requests, 5-10 is often a good range.
+        # Let's set it to 8 as a balanced starting point.
+        desired_thread_count = 8
+        try:
+            # import os # os is already imported at the top of the file
+            cpu_cores = os.cpu_count()
+            if cpu_cores:
+                # A common pattern for I/O-bound tasks is a bit more than CPU cores
+                # desired_thread_count = min(32, cpu_cores * 2 if cpu_cores * 2 > 0 else 4) # Example: 2x cores
+                pass # Keep desired_thread_count = 8 for now for simplicity and predictability
+        except Exception:
+            # Fallback if os.cpu_count() fails or is unavailable
+            pass # Keep desired_thread_count = 8
+
+        self.thread_pool.setMaxThreadCount(desired_thread_count)
+        print(f"Thread pool max threads set to: {self.thread_pool.maxThreadCount()}") # For debugging/verification
+
         self.active_batch_tasks = 0
         self.batch_start_time = 0
         self.chapters_to_process_total = 0
