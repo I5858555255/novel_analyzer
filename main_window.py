@@ -6,6 +6,7 @@ import threading
 import queue
 import time
 import copy
+import tiktoken # Added import
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QTreeWidget, QTreeWidgetItem,
                              QTextEdit, QFileDialog, QPushButton, QComboBox,
@@ -39,6 +40,9 @@ class MainWindow(QMainWindow):
         self.custom_prompt = DEFAULT_CUSTOM_PROMPT
         self.model_configs = copy.deepcopy(DEFAULT_MODEL_CONFIGS)
         self.initial_model_keys = set(self.model_configs.keys())
+
+        self.tiktoken_encoding_cache = {} # Added
+        self.tiktoken_cache_lock = threading.Lock() # Added
 
         self.thread_pool = QThreadPool()
         desired_thread_count = 8
@@ -349,7 +353,10 @@ class MainWindow(QMainWindow):
         if parent and hasattr(parent, 'summary') and parent.summary: context = parent.summary
         try:
             api_config = {"url": self.api_url_input.text().strip(), "key": self.api_key_input.text().strip(), "model": self.get_current_model_name()}
-            current_llm_processor_instance = LLMProcessor(api_config, self.custom_prompt)
+            encoding_object = self.get_tiktoken_encoding(api_config['model'])
+            if encoding_object is None:
+                QMessageBox.critical(self, "错误", f"无法为模型 {api_config['model']} 初始化Token编码器。"); return
+            current_llm_processor_instance = LLMProcessor(api_config, self.custom_prompt, encoding_object)
             self.work_queue.put((current, context))
             self.worker_thread = WorkerThread(self.work_queue, current_llm_processor_instance)
             if self.worker_thread and self.worker_thread.isRunning():
@@ -411,6 +418,9 @@ class MainWindow(QMainWindow):
                 "model": self.get_current_model_name()
             }
             print(f"DEBUG: summarize_all - api_config created: {api_config.get('model')}")
+            encoding_object = self.get_tiktoken_encoding(api_config['model'])
+            if encoding_object is None:
+                QMessageBox.critical(self, "错误", f"无法为模型 {api_config['model']} 初始化Token编码器。批量处理中止。"); return
         except Exception as e:
             QMessageBox.critical(self, "配置错误", f"API配置无效: {str(e)}")
             print(f"DEBUG: summarize_all returned - api_config creation error: {e}")
@@ -433,7 +443,8 @@ class MainWindow(QMainWindow):
                 chapter_context=task_data["context"],
                 api_config=api_config,
                 custom_prompt_text=self.custom_prompt,
-                main_window_ref=self
+                main_window_ref=self,
+                encoding_object=encoding_object
             )
             runnable_task.signals.update_signal.connect(self.handle_chapter_summary_update)
             runnable_task.signals.progress_signal.connect(self.update_batch_progress)
@@ -963,7 +974,10 @@ class MainWindow(QMainWindow):
         if not self.validate_config(): return
         try:
             api_config = {"url": self.api_url_input.text().strip(), "key": self.api_key_input.text().strip(), "model": self.get_current_model_name()}
-            processor = LLMProcessor(api_config, self.custom_prompt)
+            encoding_object = self.get_tiktoken_encoding(api_config['model'])
+            if encoding_object is None:
+                QMessageBox.critical(self, "错误", f"无法为模型 {api_config['model']} 初始化Token编码器。测试中止。"); return
+            processor = LLMProcessor(api_config, self.custom_prompt, encoding_object)
             test_text = "这是一个连接测试。"
             self.status_label.setText("正在测试连接..."); QApplication.processEvents()
             summary, in_tokens, out_tokens = processor.summarize(test_text, max_retries=1)
@@ -1028,6 +1042,90 @@ class MainWindow(QMainWindow):
         else:
             self.status_label.setText("没有可保存的章节修改或当前非编辑模式。")
 
+
+    def get_tiktoken_encoding(self, model_name_from_config: str):
+        # Determine the effective model name or encoding name for tiktoken
+        # This logic is similar to what was in LLMProcessor.__init__
+        # It needs access to tiktoken module.
+        # Ensure 'import tiktoken' is at the top of main_window.py
+
+        effective_encoding_key = None
+        try:
+            # Try to get a specific model encoding name (e.g., "gpt-4", "gpt-3.5-turbo")
+            # This part needs careful mapping, similar to LLMProcessor's old init
+            # For simplicity, let's assume model_name_from_config can sometimes be directly used
+            # or we map it to a known tiktoken model or a base encoding like 'cl100k_base'.
+
+            # Simplified logic: try direct model name, then map, then default.
+            # This logic should mirror what LLMProcessor used to do to find an encoding.
+            # This is crucial and must be robust.
+
+            _model_key_for_tiktoken = model_name_from_config.split('/')[-1].lower()
+
+            # Common mappings (can be expanded or made more sophisticated)
+            encoding_map = {
+                'gpt-4': 'cl100k_base', # Often works directly with tiktoken.encoding_for_model("gpt-4")
+                'gpt-3.5-turbo': 'cl100k_base', # Also often works directly
+                'deepseek-chat': 'cl100k_base',
+                'qwen': 'cl100k_base', # For qwen-turbo, qwen-plus etc.
+                'chatglm': 'cl100k_base', # For chatglm-pro etc.
+                # Add other known prefixes if they map to specific tiktoken models or base encodings
+            }
+
+            # First, try the direct model key if it's specific (like "gpt-4")
+            try:
+                effective_encoding_key = _model_key_for_tiktoken
+                # Check cache first with this specific key
+                with self.tiktoken_cache_lock:
+                    if effective_encoding_key in self.tiktoken_encoding_cache:
+                        return self.tiktoken_encoding_cache[effective_encoding_key]
+                # If not cached, try to get it
+                encoding_obj = tiktoken.encoding_for_model(effective_encoding_key)
+                with self.tiktoken_cache_lock:
+                    self.tiktoken_encoding_cache[effective_encoding_key] = encoding_obj
+                print(f"DEBUG: Tiktoken encoding for '{effective_encoding_key}' (model specific) cached and returned.")
+                return encoding_obj
+            except KeyError: # Model not directly known to tiktoken.encoding_for_model
+                pass # Proceed to mapping or base encoding
+
+            # Try mapping known prefixes
+            for prefix, base_encoding_name in encoding_map.items():
+                if _model_key_for_tiktoken.startswith(prefix):
+                    effective_encoding_key = base_encoding_name
+                    break
+
+            if not effective_encoding_key: # Default if no specific model or prefix match
+                effective_encoding_key = 'cl100k_base'
+
+            # Check cache for the determined effective_encoding_key (e.g., 'cl100k_base')
+            with self.tiktoken_cache_lock:
+                if effective_encoding_key in self.tiktoken_encoding_cache:
+                    return self.tiktoken_encoding_cache[effective_encoding_key]
+
+            # If not in cache, create, cache, and return
+            print(f"DEBUG: Initializing tiktoken encoding for: '{effective_encoding_key}' (derived from '{model_name_from_config}')")
+            encoding_obj = tiktoken.get_encoding(effective_encoding_key)
+            with self.tiktoken_cache_lock:
+                self.tiktoken_encoding_cache[effective_encoding_key] = encoding_obj
+            print(f"DEBUG: Tiktoken encoding for '{effective_encoding_key}' cached and returned.")
+            return encoding_obj
+
+        except Exception as e:
+            print(f"ERROR: Failed to get/create tiktoken encoding for '{model_name_from_config}'. Error: {e}. Using default 'cl100k_base'.")
+            # Fallback to a default if everything else fails
+            with self.tiktoken_cache_lock: # Protect cache access even in fallback
+                if 'cl100k_base' in self.tiktoken_encoding_cache:
+                    return self.tiktoken_encoding_cache['cl100k_base']
+                try:
+                    encoding_obj = tiktoken.get_encoding('cl100k_base')
+                    self.tiktoken_encoding_cache['cl100k_base'] = encoding_obj
+                    return encoding_obj
+                except Exception as e_default: # Should not happen if tiktoken is installed
+                     print(f"CRITICAL ERROR: Failed to get default tiktoken encoder 'cl100k_base': {e_default}")
+                     # This is a critical failure. Application might not function correctly for token counts.
+                     # Raising an error or returning None might be options.
+                     # For now, returning None and LLMProcessor should handle it.
+                     return None
 
     def closeEvent(self, event):
         if self.worker_thread and self.worker_thread.isRunning():
