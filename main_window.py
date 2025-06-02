@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QTreeWidget, QTreeWidget
                              QTextEdit, QFileDialog, QPushButton, QComboBox,
                              QProgressBar, QLabel, QSplitter, QVBoxLayout,
                              QHBoxLayout, QWidget, QAction, QMessageBox, QLineEdit,
-                             QHeaderView)
+                             QHeaderView, QSpinBox)
 from PyQt5.QtCore import pyqtSignal, Qt, QThread, QTimer, QThreadPool
 
 import requests
@@ -23,8 +23,6 @@ from llm_processor import LLMProcessor
 from custom_widgets import ChapterTreeItem
 from threading_utils import SummarizationSignals, SummarizationTask, WorkerThread
 from dialogs import ManageModelsDialog
-
-CHAPTERS_PER_BATCH = 10 # Constant for sequential batching
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -56,30 +54,28 @@ class MainWindow(QMainWindow):
         self.thread_pool.setMaxThreadCount(desired_thread_count)
         print(f"Thread pool max threads set to: {self.thread_pool.maxThreadCount()}")
 
-        # Batch processing state variables
-        self.active_batch_tasks = 0 # Number of tasks active in the CURRENT chunk
+        self.active_batch_tasks = 0
         self.batch_start_time = 0
-        self.chapters_to_process_total = 0 # TOTAL chapters for the entire summarize_all operation
-        self.chapters_processed_count = 0  # TOTAL chapters processed so far for the entire operation
+        self.chapters_to_process_total = 0
+        self.chapters_processed_count = 0
         self.total_input_tokens_batch = 0
         self.total_output_tokens_batch = 0
         self.average_time_per_chapter = 0
         self.stop_batch_requested = False
 
-        # Sequential batching variables
         self.pending_batch_tasks_data = []
         self.current_batch_chunk_offset = 0
 
         self._is_ui_ready = False
         self.auto_export_base_dir = os.path.join(os.path.expanduser("~"), "Desktop", "NovelAnalyzer_Exports")
 
-        self.init_ui()
+        self.init_ui() # batch_size_spinbox is created here
         self._is_ui_ready = True
 
         self.auto_save_timer = QTimer()
         self.auto_save_timer.timeout.connect(lambda: self.save_config(silent=True))
         self.auto_save_timer.start(30000)
-        self.load_config(silent=True)
+        self.load_config(silent=True) # batch_size_spinbox value is loaded here
 
     def init_ui(self):
         main_widget = QWidget()
@@ -88,8 +84,8 @@ class MainWindow(QMainWindow):
         control_layout = QHBoxLayout()
         self.model_combo = QComboBox()
         self.model_combo.setEditable(True)
-        for model_key, config in self.model_configs.items():
-            self.model_combo.addItem(config["display_name"], model_key)
+        for model_key, config_item in self.model_configs.items(): # Renamed config to config_item to avoid conflict
+            self.model_combo.addItem(config_item["display_name"], model_key)
         self.model_combo.setCurrentIndex(-1)
         self.model_combo.setPlaceholderText("选择或输入模型名称")
         self.model_combo.currentTextChanged.connect(self.on_model_changed)
@@ -147,17 +143,32 @@ class MainWindow(QMainWindow):
         self.content_display = QTextEdit()
         self.content_display.setReadOnly(True)
         right_panel_layout.addWidget(self.content_display)
+
         btn_layout = QHBoxLayout()
         self.summarize_btn = QPushButton("提炼当前")
         self.summarize_btn.clicked.connect(self.summarize_selected)
         btn_layout.addWidget(self.summarize_btn)
+
+        self.batch_size_label = QLabel("每批章节数:")
+        btn_layout.addWidget(self.batch_size_label)
+
+        self.batch_size_spinbox = QSpinBox()
+        self.batch_size_spinbox.setMinimum(1)
+        self.batch_size_spinbox.setMaximum(100)
+        self.batch_size_spinbox.setValue(10) # Default value, will be overridden by load_config if available
+        self.batch_size_spinbox.setSingleStep(1)
+        self.batch_size_spinbox.setToolTip("设置“一键提炼”时每批处理的章节数量 (1-100)")
+        btn_layout.addWidget(self.batch_size_spinbox)
+
         self.summarize_all_btn = QPushButton("一键提炼")
         self.summarize_all_btn.clicked.connect(self.summarize_all)
         btn_layout.addWidget(self.summarize_all_btn)
+
         self.stop_btn = QPushButton("停止处理")
         self.stop_btn.clicked.connect(self.stop_processing)
         self.stop_btn.setEnabled(False)
         btn_layout.addWidget(self.stop_btn)
+
         right_panel_layout.addLayout(btn_layout)
         right_widget = QWidget()
         right_widget.setLayout(right_panel_layout)
@@ -202,8 +213,8 @@ class MainWindow(QMainWindow):
             current_text = self.model_combo.currentText()
             current_data = self.model_combo.currentData()
             if current_data and current_data in self.model_configs:
-                config = self.model_configs[current_data]
-                self.api_url_input.setText(config["url"])
+                config_data = self.model_configs[current_data] # Renamed to avoid conflict
+                self.api_url_input.setText(config_data["url"])
             elif current_text and current_text not in [self.model_combo.itemText(i) for i in range(self.model_combo.count())]:
                 pass
         except Exception as e:
@@ -398,6 +409,7 @@ class MainWindow(QMainWindow):
             self.summarize_btn.setEnabled(False)
             self.summarize_all_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
+            self.batch_size_spinbox.setEnabled(False) # Disable during single task too
             self.status_label.setText(f"正在处理章节: {current.original_title}...")
 
             print(f"DEBUG: summarize_selected - Starting WorkerThread for chapter: {current.original_title}")
@@ -413,6 +425,7 @@ class MainWindow(QMainWindow):
             self.summarize_btn.setEnabled(True)
             self.summarize_all_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
+            self.batch_size_spinbox.setEnabled(True)
 
     def summarize_all(self):
         print("DEBUG: summarize_all called")
@@ -438,8 +451,6 @@ class MainWindow(QMainWindow):
                 if isinstance(chapter_item, ChapterTreeItem) and not chapter_item.is_summarized:
                     identifier = (vol_item.text(0), chapter_item.original_title)
                     content = chapter_item.content
-                    # Simple context: Use parent volume's summary if available and it's ChapterTreeItem (though volumes are usually just QTreeWidgetItems)
-                    # For now, keeping context simple or empty for batch tasks. Advanced context can be a future enhancement.
                     current_context = ""
                     all_tasks_data_list.append({
                         "identifier": identifier, "content": content, "context": current_context
@@ -453,12 +464,8 @@ class MainWindow(QMainWindow):
         self.pending_batch_tasks_data = all_tasks_data_list
         self.current_batch_chunk_offset = 0
 
-        # Initialize overall progress and UI for the entire batch operation
         self.start_batch_processing(len(self.pending_batch_tasks_data))
-
-        # Start processing the first chunk
         self.process_next_batch_chunk()
-
 
     def process_next_batch_chunk(self):
         print(f"DEBUG: process_next_batch_chunk called. Offset: {self.current_batch_chunk_offset}, Stop: {self.stop_batch_requested}")
@@ -467,23 +474,24 @@ class MainWindow(QMainWindow):
                  self.processing_finished(stopped_by_user=True)
             return
 
+        current_chapters_per_batch = self.batch_size_spinbox.value()
+        if current_chapters_per_batch <= 0:
+            current_chapters_per_batch = 10
+
         start_index = self.current_batch_chunk_offset
-        end_index = start_index + CHAPTERS_PER_BATCH
+        end_index = start_index + current_chapters_per_batch
         current_chunk_tasks_data = self.pending_batch_tasks_data[start_index:end_index]
 
         if not current_chunk_tasks_data:
-            if self.active_batch_tasks == 0: # Should be true if all tasks are done
+            if self.active_batch_tasks == 0:
                 print("DEBUG: process_next_batch_chunk - No more tasks data and no active tasks. Finishing.")
                 self.processing_finished(stopped_by_user=self.stop_batch_requested)
             else:
                 print("DEBUG: process_next_batch_chunk - No more tasks data, but waiting for active tasks to complete.")
             return
 
-        # Set active_batch_tasks for the current chunk about to be dispatched
-        # This count is decremented by handle_task_finished for each task in this chunk.
         self.active_batch_tasks = len(current_chunk_tasks_data)
         print(f"DEBUG: process_next_batch_chunk - Processing chunk: {len(current_chunk_tasks_data)} tasks. Active tasks set to: {self.active_batch_tasks}")
-
 
         try:
             api_config = {
@@ -496,16 +504,13 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "编码器错误", f"无法为模型 {api_config['model']} 初始化Token编码器。批量处理中止。")
                 self.processing_finished(stopped_by_user=True)
                 return
-        except Exception as e: # Catch errors from get_current_model_name or get_tiktoken_encoding more broadly
+        except Exception as e:
             QMessageBox.critical(self, "配置错误", f"API配置或编码器初始化无效: {str(e)}")
             self.processing_finished(stopped_by_user=True)
             return
 
         for task_data in current_chunk_tasks_data:
             if self.stop_batch_requested:
-                # If stop requested while preparing this chunk, we might have overcounted active_batch_tasks
-                # However, tasks check this flag themselves, so it's mainly about not queueing more.
-                # The active_batch_tasks will be decremented by those that were already queued.
                 print(f"DEBUG: process_next_batch_chunk - Stop requested, breaking task creation for current chunk.")
                 break
 
@@ -528,7 +533,6 @@ class MainWindow(QMainWindow):
         self.current_batch_chunk_offset = end_index
         print(f"DEBUG: process_next_batch_chunk - Next offset: {self.current_batch_chunk_offset}")
 
-
     def validate_config(self):
         print("DEBUG: validate_config called")
         if not self.api_url_input.text().strip():
@@ -542,28 +546,25 @@ class MainWindow(QMainWindow):
         print("DEBUG: validate_config succeeded")
         return True
 
-    def start_processing(self): # Placeholder, not directly used by summarize_all anymore for task submission
+    def start_processing(self):
         pass
 
     def stop_processing(self):
         print("DEBUG: stop_processing called by user.")
         self.stop_batch_requested = True
 
-        if self.worker_thread and self.worker_thread.isRunning(): # For single task worker
+        if self.worker_thread and self.worker_thread.isRunning():
             print("DEBUG: stop_processing - Stopping single WorkerThread")
             self.worker_thread.stop()
-            # UI reset for single task is handled by its processing_finished_single_task on thread stop signal
 
         self.status_label.setText("停止请求已发送... 等待当前活动任务完成或中止。")
-        self.stop_btn.setEnabled(False) # Disable stop button once clicked
+        self.stop_btn.setEnabled(False)
 
-        # If no tasks are active (e.g., stop clicked between chunks or when idle)
         if self.active_batch_tasks == 0 and not (self.worker_thread and self.worker_thread.isRunning()):
              print("DEBUG: stop_processing - No active tasks found. Calling processing_finished.")
              self.processing_finished(stopped_by_user=True)
 
-
-    def processing_finished(self, stopped_by_user=False): # For BATCH processing
+    def processing_finished(self, stopped_by_user=False):
         print(f"DEBUG: processing_finished (batch) called. Stopped by user: {stopped_by_user}")
         self.summarize_btn.setEnabled(True)
         self.summarize_all_btn.setEnabled(True)
@@ -573,17 +574,15 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"批量处理已由用户停止。已处理 {self.chapters_processed_count}/{self.chapters_to_process_total} 章节。")
         elif self.chapters_processed_count == self.chapters_to_process_total and self.chapters_to_process_total > 0:
             self.status_label.setText(f"批量提炼完成。共处理 {self.chapters_processed_count} 章节。")
-        elif self.chapters_to_process_total == 0 : # No tasks were ever scheduled (e.g. all chapters already summarized)
+        elif self.chapters_to_process_total == 0 :
              self.status_label.setText("就绪")
-        else: # Batch finished but not all chapters processed (e.g. due to errors not caught by stop_requested)
+        else:
             self.status_label.setText(f"批量处理结束。已处理 {self.chapters_processed_count}/{self.chapters_to_process_total} 章节。")
 
-        # Reset progress bar and ETA for batch
         self.progress_bar.setValue(0)
         self.eta_label.setText("预计剩余时间: N/A")
         self.metrics_label.setText("速率: N/A")
 
-        # Reset batch-specific state variables
         self.active_batch_tasks = 0
         self.chapters_to_process_total = 0
         self.chapters_processed_count = 0
@@ -595,7 +594,6 @@ class MainWindow(QMainWindow):
         self.pending_batch_tasks_data = []
         self.current_batch_chunk_offset = 0
 
-        # Re-enable UI elements
         self.chapter_tree.setEnabled(True)
         self.model_combo.setEnabled(True)
         self.api_key_input.setEnabled(True)
@@ -605,6 +603,7 @@ class MainWindow(QMainWindow):
         self.save_config_btn.setEnabled(True)
         self.load_config_btn.setEnabled(True)
         self.prompt_input.setEnabled(True)
+        self.batch_size_spinbox.setEnabled(True)
         if hasattr(self, 'add_model_action') and self.add_model_action:
             self.add_model_action.setEnabled(True)
         if hasattr(self, 'manage_models_action') and self.manage_models_action:
@@ -616,23 +615,22 @@ class MainWindow(QMainWindow):
         self.summarize_btn.setEnabled(True)
         self.summarize_all_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.batch_size_spinbox.setEnabled(True)
 
         current_item = self.chapter_tree.currentItem()
         if current_item and isinstance(current_item, ChapterTreeItem) and current_item.is_summarized:
             self.status_label.setText(f"章节 '{current_item.original_title}' 处理完成。")
-        elif current_item and isinstance(current_item, ChapterTreeItem): # Task finished but maybe no summary (error or stopped early)
+        elif current_item and isinstance(current_item, ChapterTreeItem):
             self.status_label.setText(f"章节 '{current_item.original_title}' 处理结束。")
         else:
             self.status_label.setText("单章处理完成。")
 
         if self.progress_bar.maximum() == 1:
             self.progress_bar.setValue(1)
-        # Do not reset batch counters here
         print("DEBUG: processing_finished_single_task - UI re-enabled.")
 
-
     def handle_update(self, update_type, data):
-        if update_type == "summary": # This is for single chapter worker
+        if update_type == "summary":
             item, summary_text = data
             item.summary = summary_text
             item.is_summarized = True
@@ -644,7 +642,7 @@ class MainWindow(QMainWindow):
             if item.is_summarized:
                 self.auto_export_novel_data()
 
-    def handle_chapter_summary_update(self, identifier, summary_text): # For BATCH tasks
+    def handle_chapter_summary_update(self, identifier, summary_text):
         item = self.find_chapter_item_by_identifier(identifier)
         if item:
             item.summary = summary_text
@@ -658,49 +656,37 @@ class MainWindow(QMainWindow):
                 self.auto_export_novel_data()
 
     def update_batch_progress(self, in_tokens, out_tokens, chapters_done_this_task):
-        # This signal comes from SummarizationTask (batch)
-        # Note: chapters_done_this_task is usually 1, as emitted by SummarizationTask.
-        # self.chapters_processed_count is updated in handle_task_finished, which is more robust.
-
-        self.total_tokens[0] += in_tokens # Update global tokens from batch task
+        self.total_tokens[0] += in_tokens
         self.total_tokens[1] += out_tokens
 
-        self.total_input_tokens_batch += in_tokens # Accumulate for current overall batch operation
+        self.total_input_tokens_batch += in_tokens
         self.total_output_tokens_batch += out_tokens
 
-        # The progress bar value is now set directly in handle_task_finished
-        # based on self.chapters_processed_count.
-        # self.progress_bar.setValue(self.chapters_processed_count) # This would be redundant if also in handle_task_finished
-
-        if self.chapters_to_process_total > 0 and self.chapters_processed_count > 0: # Use overall processed count for ETA
-            # Ensure batch_start_time is valid
-            if self.batch_start_time == 0: # Should have been set in start_batch_processing
+        if self.chapters_to_process_total > 0 and self.chapters_processed_count > 0:
+            if self.batch_start_time == 0:
                 print("Warning: batch_start_time is 0 in update_batch_progress. ETA/metrics might be incorrect.")
-                # This might happen if a progress signal arrives before batch_start_time is properly set, though unlikely.
-                # Or if called when not in a batch context.
-                return # Avoid division by zero or incorrect calculations
+                return
 
             elapsed_time = time.time() - self.batch_start_time
-            if elapsed_time <= 0: # Avoid division by zero if time hasn't advanced
-                elapsed_time = 1e-6 # small epsilon to prevent division by zero
+            if elapsed_time <= 0:
+                elapsed_time = 1e-6
 
-                self.average_time_per_chapter = elapsed_time / self.chapters_processed_count
-                remaining_chapters = self.chapters_to_process_total - self.chapters_processed_count
+            self.average_time_per_chapter = elapsed_time / self.chapters_processed_count
+            remaining_chapters = self.chapters_to_process_total - self.chapters_processed_count
 
-                if remaining_chapters > 0:
-                    eta_seconds = remaining_chapters * self.average_time_per_chapter
-                    self.eta_label.setText(f"ETA: {time.strftime('%H:%M:%S', time.gmtime(eta_seconds))}")
-                else:
-                    self.eta_label.setText("ETA: 完成")
+            if remaining_chapters > 0:
+                eta_seconds = remaining_chapters * self.average_time_per_chapter
+                self.eta_label.setText(f"ETA: {time.strftime('%H:%M:%S', time.gmtime(eta_seconds))}")
+            else:
+                self.eta_label.setText("ETA: 完成")
 
-                chapters_per_minute = self.chapters_processed_count / (elapsed_time / 60)
-                tokens_per_second = (self.total_input_tokens_batch + self.total_output_tokens_batch) / elapsed_time
-                self.metrics_label.setText(f"{chapters_per_minute:.2f} 章/分钟 | {tokens_per_second:.2f} Token/秒")
+            chapters_per_minute = self.chapters_processed_count / (elapsed_time / 60)
+            tokens_per_second = (self.total_input_tokens_batch + self.total_output_tokens_batch) / elapsed_time
+            self.metrics_label.setText(f"{chapters_per_minute:.2f} 章/分钟 | {tokens_per_second:.2f} Token/秒")
 
-        self.token_label.setText(f"总消耗: 输入 {self.total_tokens[0]} | 输出 {self.total_tokens[1]}") # Global token count updated
+        self.token_label.setText(f"总消耗: 输入 {self.total_tokens[0]} | 输出 {self.total_tokens[1]}")
 
-
-    def handle_chapter_error(self, identifier, error_msg): # For BATCH tasks
+    def handle_chapter_error(self, identifier, error_msg):
         if isinstance(identifier, tuple) and len(identifier) == 2:
             vol_title, chap_original_title = identifier
             item = self.find_chapter_item_by_identifier(identifier)
@@ -712,18 +698,17 @@ class MainWindow(QMainWindow):
         print(f"ERROR_BATCH_CHAPTER: {full_error_message}")
         self.status_label.setText(f"错误: 章节 '{id_str}' - {error_msg[:100]}...")
 
-    def handle_task_finished(self, identifier): # For BATCH tasks
+    def handle_task_finished(self, identifier):
         self.active_batch_tasks -= 1
-        self.chapters_processed_count +=1 # Increment overall processed count
+        self.chapters_processed_count +=1
         print(f"DEBUG: Task finished for {identifier}. Active tasks remaining in chunk: {self.active_batch_tasks}. Total processed: {self.chapters_processed_count}/{self.chapters_to_process_total}")
 
         if self.chapters_to_process_total > 0:
-            self.progress_bar.setValue(self.chapters_processed_count) # Directly set progress bar value
+            self.progress_bar.setValue(self.chapters_processed_count)
 
-            # Update ETA etc. based on new overall progress
-            if self.chapters_processed_count > 0 and self.batch_start_time > 0: # batch_start_time should be valid
+            if self.chapters_processed_count > 0 and self.batch_start_time > 0:
                 elapsed_time = time.time() - self.batch_start_time
-                if elapsed_time <= 0: elapsed_time = 1e-6 # prevent division by zero
+                if elapsed_time <= 0: elapsed_time = 1e-6
                 self.average_time_per_chapter = elapsed_time / self.chapters_processed_count
                 remaining_chapters = self.chapters_to_process_total - self.chapters_processed_count
                 if remaining_chapters > 0:
@@ -732,19 +717,16 @@ class MainWindow(QMainWindow):
                 else:
                     self.eta_label.setText("ETA: 完成")
 
-
         if self.active_batch_tasks == 0:
             if self.chapters_processed_count < self.chapters_to_process_total and not self.stop_batch_requested:
                 print(f"DEBUG: Chunk finished. Processed: {self.chapters_processed_count}/{self.chapters_to_process_total}. Starting next chunk.")
                 self.process_next_batch_chunk()
             else:
                 print(f"DEBUG: All tasks finished or stop requested. Processed: {self.chapters_processed_count}/{self.chapters_to_process_total}.")
-                # Consolidate token count from batch accumulators to global
                 self.total_tokens[0] += self.total_input_tokens_batch
                 self.total_tokens[1] += self.total_output_tokens_batch
                 self.token_label.setText(f"Token消耗: 输入 {self.total_tokens[0]} | 输出 {self.total_tokens[1]}")
                 self.processing_finished(stopped_by_user=self.stop_batch_requested)
-
 
     def find_chapter_item_by_identifier(self, identifier):
         if not isinstance(identifier, tuple) or len(identifier) != 2:
@@ -761,34 +743,31 @@ class MainWindow(QMainWindow):
             if vol_item.text(0) == target_vol_title:
                 for j in range(vol_item.childCount()):
                     chapter_item = vol_item.child(j)
-                    if isinstance(chapter_item, ChapterTreeItem) and \
-                       hasattr(chapter_item, 'original_title') and \
-                       chapter_item.original_title == target_chap_original_title:
+                    if isinstance(chap_item, ChapterTreeItem) and \
+                       hasattr(chap_item, 'original_title') and \
+                       chap_item.original_title == target_chap_original_title:
                         return chapter_item
                 return None
         return None
 
-    def handle_error(self, error_msg): # For SINGLE task (WorkerThread)
+    def handle_error(self, error_msg):
         full_error_message = f"处理错误 (单个章节): {error_msg}"
         print(f"ERROR_SINGLE_CHAPTER: {full_error_message}")
         self.status_label.setText(f"处理错误: {error_msg[:150]}...")
-        # processing_finished_single_task is connected to worker_thread.finished, handles UI
 
-
-    def start_batch_processing(self, total_overall_tasks): # Renamed parameter
+    def start_batch_processing(self, total_overall_tasks):
         print(f"DEBUG: start_batch_processing called with total_overall_tasks: {total_overall_tasks}")
 
-        # Reset overall counters for the new batch operation
         self.chapters_to_process_total = total_overall_tasks
         self.chapters_processed_count = 0
-        self.total_input_tokens_batch = 0 # Accumulator for the entire batch operation
+        self.total_input_tokens_batch = 0
         self.total_output_tokens_batch = 0
         self.batch_start_time = time.time()
         self.average_time_per_chapter = 0
-        self.active_batch_tasks = 0 # Will be set per-chunk by process_next_batch_chunk
+        self.active_batch_tasks = 0
         self.stop_batch_requested = False
-        self.pending_batch_tasks_data = [] # Clear any old data
-        self.current_batch_chunk_offset = 0
+        # self.pending_batch_tasks_data is set by summarize_all before calling this
+        # self.current_batch_chunk_offset is set by summarize_all before calling this
 
         self.progress_bar.setMaximum(total_overall_tasks if total_overall_tasks > 0 else 100)
         self.progress_bar.setValue(0)
@@ -805,6 +784,7 @@ class MainWindow(QMainWindow):
         self.save_config_btn.setEnabled(False)
         self.load_config_btn.setEnabled(False)
         self.prompt_input.setEnabled(False)
+        self.batch_size_spinbox.setEnabled(False)
 
         if hasattr(self, 'add_model_action') and self.add_model_action:
             self.add_model_action.setEnabled(False)
@@ -816,13 +796,13 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(True)
         print("DEBUG: start_batch_processing finished UI disabling")
 
-    def update_progress(self, in_tokens, out_tokens, count): # For SINGLE task (WorkerThread's progress_signal)
-        self.total_tokens[0] += in_tokens # Update global tokens from single task
+    def update_progress(self, in_tokens, out_tokens, count):
+        self.total_tokens[0] += in_tokens
         self.total_tokens[1] += out_tokens
         self.token_label.setText(
             f"Token消耗: 输入 {self.total_tokens[0]} | 输出 {self.total_tokens[1]}"
         )
-        if self.progress_bar.maximum() == 1: # Check if it's single task mode
+        if self.progress_bar.maximum() == 1:
              self.progress_bar.setValue(self.progress_bar.value() + count)
 
     def export_results(self):
@@ -956,7 +936,8 @@ class MainWindow(QMainWindow):
             "api_key": self.api_key_input.text(), "export_path": self.default_export_path,
             "custom_models": {k: v for k, v in self.model_configs.items() if k not in self.initial_model_keys},
             "book_data": self.book_data, "summary_mode": self.summary_mode_btn.isChecked(),
-            "custom_prompt": self.custom_prompt, "chapter_states": self.get_chapter_states()
+            "custom_prompt": self.custom_prompt, "chapter_states": self.get_chapter_states(),
+            "batch_size": self.batch_size_spinbox.value() # Save batch size
         }
         try:
             with open("config.json", 'w', encoding='utf-8') as f: json.dump(config, f, ensure_ascii=False, indent=2)
@@ -987,43 +968,56 @@ class MainWindow(QMainWindow):
 
     def load_config(self, silent=False):
         config_path = "config.json"
+        default_batch_size = 10
         if not os.path.exists(config_path):
             if not silent: QMessageBox.information(self, "提示", "未找到配置文件。")
             else: print("Config file not found on startup. Skipping load.")
+            self.batch_size_spinbox.setValue(default_batch_size)
             return
         try:
-            with open(config_path, 'r', encoding='utf-8') as f: config = json.load(f)
+            with open(config_path, 'r', encoding='utf-8') as f: config_data = json.load(f) # Renamed to config_data
 
-            if "custom_models" in config:
-                for model_key, model_data in config["custom_models"].items():
+            if "custom_models" in config_data:
+                for model_key, model_data_val in config_data["custom_models"].items(): # Renamed model_data to model_data_val
                     if model_key not in self.initial_model_keys:
-                         self.model_configs[model_key] = model_data
+                         self.model_configs[model_key] = model_data_val
                          if self.model_combo.findData(model_key) == -1:
-                              self.model_combo.addItem(model_data.get("display_name", model_key), model_key)
+                              self.model_combo.addItem(model_data_val.get("display_name", model_key), model_key)
 
-            if config.get("model"):
-                model_to_select = config["model"]
+            if config_data.get("model"):
+                model_to_select = config_data["model"]
                 index = self.model_combo.findData(model_to_select)
                 if index == -1:
                     index = self.model_combo.findText(model_to_select)
                 if index != -1: self.model_combo.setCurrentIndex(index)
 
-            self.api_url_input.setText(config.get("api_url", ""))
-            self.api_key_input.setText(config.get("api_key", ""))
-            self.default_export_path = config.get("export_path", "")
-            self.custom_prompt = config.get("custom_prompt", DEFAULT_CUSTOM_PROMPT)
+            self.api_url_input.setText(config_data.get("api_url", ""))
+            self.api_key_input.setText(config_data.get("api_key", ""))
+            self.default_export_path = config_data.get("export_path", "")
+            self.custom_prompt = config_data.get("custom_prompt", DEFAULT_CUSTOM_PROMPT)
             self.prompt_input.setText(self.custom_prompt)
 
+            loaded_batch_size_val = config_data.get("batch_size", default_batch_size) # Renamed
+            try:
+                loaded_batch_size_int = int(loaded_batch_size_val) # Renamed
+                if not (self.batch_size_spinbox.minimum() <= loaded_batch_size_int <= self.batch_size_spinbox.maximum()):
+                    loaded_batch_size_int = default_batch_size
+                    print(f"Warning: Loaded batch_size '{config_data.get('batch_size')}' out of range, reset to {loaded_batch_size_int}.")
+            except (ValueError, TypeError):
+                loaded_batch_size_int = default_batch_size
+                print(f"Warning: Invalid batch_size '{config_data.get('batch_size')}' in config, reset to {loaded_batch_size_int}.")
+            self.batch_size_spinbox.setValue(loaded_batch_size_int)
+
             reloaded_successfully = False
-            if "book_data" in config and config["book_data"].get("file_path"):
-                self.book_data = config["book_data"]
+            if "book_data" in config_data and config_data["book_data"].get("file_path"):
+                self.book_data = config_data["book_data"]
                 reloaded_successfully = self.reload_novel()
 
-            if reloaded_successfully and "chapter_states" in config:
-                self.restore_chapter_states(config["chapter_states"])
+            if reloaded_successfully and "chapter_states" in config_data:
+                self.restore_chapter_states(config_data["chapter_states"])
 
-            if "summary_mode" in config:
-                self.summary_mode_btn.setChecked(config["summary_mode"])
+            if "summary_mode" in config_data:
+                self.summary_mode_btn.setChecked(config_data["summary_mode"])
                 self.toggle_display_mode()
 
             if not silent: QMessageBox.information(self, "成功", "配置已加载")
@@ -1035,9 +1029,11 @@ class MainWindow(QMainWindow):
         except json.JSONDecodeError as e:
             if not silent: QMessageBox.critical(self, "错误", f"加载配置失败: 配置文件格式错误。\n{str(e)}")
             else: print(f"Error decoding config.json: {e}")
+            self.batch_size_spinbox.setValue(default_batch_size)
         except Exception as e:
             if not silent: QMessageBox.critical(self, "错误", f"加载配置失败: {str(e)}")
             else: print(f"Error during silent load_config: {e}")
+            self.batch_size_spinbox.setValue(default_batch_size)
 
     def reload_novel(self):
         file_path = self.book_data.get("file_path")
@@ -1150,7 +1146,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "连接失败", error_msg)
             self.status_label.setText("连接测试失败")
 
-    def auto_save(self): # auto_save_config is the one connected to timer
+    def auto_save(self):
         self.save_config(silent=True)
 
     def auto_export_novel_data(self):
@@ -1261,7 +1257,7 @@ class MainWindow(QMainWindow):
             else:
                 event.ignore()
                 return
-        try: self.save_config(silent=True)
+        try: self.save_config(silent=True) # Ensure config is saved on normal close
         except Exception as e: print(f"Error saving config on close: {e}")
         event.accept()
 
