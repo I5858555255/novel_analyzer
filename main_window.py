@@ -130,12 +130,11 @@ class MainWindow(QMainWindow):
         self.chapter_tree.setHeaderLabels(["章节/卷", "字数"])
         self.chapter_tree.itemClicked.connect(self.show_content)
 
-        # Configure column resizing for chapter_tree
         header = self.chapter_tree.header()
-        header.setSectionResizeMode(0, QHeaderView.Stretch)       # For Chapter/Volume Name (column 0)
-        header.setMinimumSectionSize(300)                         # For Chapter/Volume Name (column 0)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents) # For Word Count (column 1)
-        header.setStretchLastSection(False)                         # Ensure this is present and False
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setMinimumSectionSize(300)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setStretchLastSection(False)
 
         splitter.addWidget(self.chapter_tree)
         right_panel_layout = QVBoxLayout()
@@ -287,19 +286,17 @@ class MainWindow(QMainWindow):
 
     def build_chapter_tree(self, chapters):
         print(f"DEBUG: Entering MainWindow.build_chapter_tree (processing {len(chapters)} volumes/groups)")
-        self.chapter_tree.setUpdatesEnabled(False) # <<< ADDED: Disable updates
+        self.chapter_tree.setUpdatesEnabled(False)
         try:
             self.chapter_tree.clear()
             root_title = self.book_data.get("title", "未命名书籍")
             root = QTreeWidgetItem(self.chapter_tree, [root_title, ""])
-            # root.setExpanded(True) # Defer expanding
 
             total_chapters = 0
             total_words = 0
             for volume_data in chapters:
                 vol_words = sum(c['word_count'] for c in volume_data['chapters'])
                 vol_item = QTreeWidgetItem(root, [volume_data['title'], f"{len(volume_data['chapters'])}章, {vol_words}字"])
-                # vol_item.setExpanded(True) # Defer expanding
 
                 for chapter_data in volume_data['chapters']:
                     chapter_item = ChapterTreeItem(
@@ -308,19 +305,17 @@ class MainWindow(QMainWindow):
                         chapter_data['word_count'],
                         vol_item
                     )
-                    # print(f"DEBUG: MainWindow.build_chapter_tree - created ChapterTreeItem: {chapter_data['title']}") # Optional debug print
                     chapter_item.update_display_text()
                     total_chapters += 1
                 total_words += vol_words
 
             root.setText(1, f"{len(chapters)}卷, {total_chapters}章, {total_words}字")
 
-            # Expand items after all are added
             root.setExpanded(True)
             for i in range(root.childCount()):
                 root.child(i).setExpanded(True)
         finally:
-            self.chapter_tree.setUpdatesEnabled(True) # <<< ADDED: Re-enable updates
+            self.chapter_tree.setUpdatesEnabled(True)
             print("DEBUG: Exiting MainWindow.build_chapter_tree")
 
     def show_content(self, item):
@@ -343,36 +338,75 @@ class MainWindow(QMainWindow):
         return current_data if current_data else self.model_combo.currentText().strip()
 
     def summarize_selected(self):
+        print("DEBUG: summarize_selected called")
         current = self.chapter_tree.currentItem()
         if not current or not isinstance(current, ChapterTreeItem):
             QMessageBox.warning(self, "提示", "请先选择要提炼的章节")
             return
-        if not self.validate_config(): return
+
+        if not self.validate_config():
+            print("DEBUG: summarize_selected - validate_config failed")
+            return
+
         context = ""
         parent = current.parent()
-        if parent and hasattr(parent, 'summary') and parent.summary: context = parent.summary
+        if parent and isinstance(parent, ChapterTreeItem) and parent.is_summarized and parent.summary:
+            context = parent.summary
+        elif parent and not isinstance(parent, ChapterTreeItem) and parent.text(0) != self.book_data.get("title"):
+             pass
+
         try:
-            api_config = {"url": self.api_url_input.text().strip(), "key": self.api_key_input.text().strip(), "model": self.get_current_model_name()}
+            api_config = {
+                "url": self.api_url_input.text().strip(),
+                "key": self.api_key_input.text().strip(),
+                "model": self.get_current_model_name()
+            }
+            print(f"DEBUG: summarize_selected - API Config: {api_config}")
+
             encoding_object = self.get_tiktoken_encoding(api_config['model'])
+            print(f"DEBUG: summarize_selected - Encoding Object: {type(encoding_object)}")
+
             if encoding_object is None:
-                QMessageBox.critical(self, "错误", f"无法为模型 {api_config['model']} 初始化Token编码器。"); return
+                QMessageBox.critical(self, "编码器错误", f"无法为模型 '{api_config.get('model','未知')}' 初始化Token编码器。提炼中止。")
+                self.status_label.setText(f"错误: 模型 '{api_config.get('model','未知')}' Token编码器初始化失败。")
+                print("DEBUG: summarize_selected - encoding_object is None, aborting.")
+                return
+
+            print("DEBUG: summarize_selected - Instantiating LLMProcessor for WorkerThread")
             current_llm_processor_instance = LLMProcessor(api_config, self.custom_prompt, encoding_object)
+            print("DEBUG: summarize_selected - LLMProcessor for WorkerThread instantiated")
+
+            if self.worker_thread and self.worker_thread.isRunning():
+                 QMessageBox.warning(self, "提示", "已有单章提炼任务在进行中。请等待其完成。")
+                 print("DEBUG: summarize_selected - WorkerThread already running.")
+                 return
+
             self.work_queue.put((current, context))
             self.worker_thread = WorkerThread(self.work_queue, current_llm_processor_instance)
-            if self.worker_thread and self.worker_thread.isRunning():
-                 QMessageBox.warning(self, "提示", "已有提炼任务在进行中。")
-                 return
+
             self.worker_thread.update_signal.connect(self.handle_update)
             self.worker_thread.progress_signal.connect(self.update_progress)
             self.worker_thread.error_signal.connect(self.handle_error)
-            self.worker_thread.finished.connect(self.processing_finished)
-            self.worker_thread.start()
+            self.worker_thread.finished.connect(self.processing_finished_single_task)
+
             self.summarize_btn.setEnabled(False)
             self.summarize_all_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
-            self.status_label.setText("正在处理当前章节...")
+            self.status_label.setText(f"正在处理章节: {current.original_title}...")
+
+            print(f"DEBUG: summarize_selected - Starting WorkerThread for chapter: {current.original_title}")
+            self.progress_bar.setMaximum(1)
+            self.progress_bar.setValue(0)
+            self.worker_thread.start()
+
         except Exception as e:
-            QMessageBox.critical(self, "错误", f"初始化失败: {str(e)}")
+            error_msg = f"启动单章提炼失败: {str(e)}"
+            print(f"DEBUG: summarize_selected - EXCEPTION: {error_msg}")
+            QMessageBox.critical(self, "错误", error_msg)
+            self.status_label.setText("单章提炼启动失败。")
+            self.summarize_btn.setEnabled(True)
+            self.summarize_all_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
 
     def summarize_all(self):
         print("DEBUG: summarize_all called")
@@ -488,7 +522,7 @@ class MainWindow(QMainWindow):
              elif self.chapters_to_process_total == 0 and self.chapters_processed_count == 0:
                   self.processing_finished(stopped_by_user=True)
 
-    def processing_finished(self, stopped_by_user=False):
+    def processing_finished(self, stopped_by_user=False): # This is for BATCH processing
         self.summarize_btn.setEnabled(True)
         self.summarize_all_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
@@ -498,16 +532,17 @@ class MainWindow(QMainWindow):
         elif self.chapters_to_process_total > 0 and self.chapters_processed_count == self.chapters_to_process_total:
             final_message = f"批量提炼处理完毕。\n共处理章节数: {self.chapters_processed_count}"
             self.status_label.setText("批量提炼完成")
-        else:
-            final_message = "处理完成。"
+        else: # This case might be for single chapter if it was routed here, or incomplete batch.
+            final_message = "处理完成。" # Generic
             self.status_label.setText("处理完成")
 
         print(f"INFO: Processing finished. Message: {final_message}")
-        # QMessageBox.information(self, "处理结束", final_message) # Pop-up removed
 
-        self.progress_bar.setValue(0)
+        self.progress_bar.setValue(0) # Reset progress bar
         self.eta_label.setText("预计剩余时间: N/A")
         self.metrics_label.setText("速率: N/A")
+
+        # Reset batch-specific counters
         self.active_batch_tasks = 0
         self.chapters_to_process_total = 0
         self.chapters_processed_count = 0
@@ -515,7 +550,9 @@ class MainWindow(QMainWindow):
         self.total_output_tokens_batch = 0
         self.batch_start_time = 0
         self.average_time_per_chapter = 0
-        self.stop_batch_requested = False
+        self.stop_batch_requested = False # Reset stop request
+
+        # Re-enable UI elements
         self.chapter_tree.setEnabled(True)
         self.model_combo.setEnabled(True)
         self.api_key_input.setEnabled(True)
@@ -525,11 +562,28 @@ class MainWindow(QMainWindow):
         self.save_config_btn.setEnabled(True)
         self.load_config_btn.setEnabled(True)
         self.prompt_input.setEnabled(True)
-        # self.export_btn.setEnabled(True) # Already removed
         if hasattr(self, 'add_model_action') and self.add_model_action:
             self.add_model_action.setEnabled(True)
         if hasattr(self, 'manage_models_action') and self.manage_models_action:
             self.manage_models_action.setEnabled(True)
+
+    def processing_finished_single_task(self): # New slot for single task
+        print("DEBUG: processing_finished_single_task called")
+        self.summarize_btn.setEnabled(True)
+        self.summarize_all_btn.setEnabled(True) # Re-enable batch button as well
+        self.stop_btn.setEnabled(False)
+
+        current_item = self.chapter_tree.currentItem()
+        if current_item and isinstance(current_item, ChapterTreeItem) and current_item.is_summarized:
+            self.status_label.setText(f"章节 '{current_item.original_title}' 处理完成。")
+        elif current_item and isinstance(current_item, ChapterTreeItem):
+            self.status_label.setText(f"章节 '{current_item.original_title}' 处理结束（可能未提炼或有错误）。")
+        else:
+            self.status_label.setText("单章处理完成。")
+
+        if self.progress_bar.maximum() == 1: # Check if it was set for single task
+            self.progress_bar.setValue(1) # Mark as complete
+        # Or, to clear it for next batch use: self.progress_bar.setValue(0)
 
     def handle_update(self, update_type, data):
         if update_type == "summary":
@@ -557,11 +611,11 @@ class MainWindow(QMainWindow):
             if item.is_summarized:
                 self.auto_export_novel_data()
 
-    def update_batch_progress(self, in_tokens, out_tokens, chapters_done_this_task):
+    def update_batch_progress(self, in_tokens, out_tokens, chapters_done_this_task): # Primarily for BATCH
         self.total_input_tokens_batch += in_tokens
         self.total_output_tokens_batch += out_tokens
         self.chapters_processed_count += chapters_done_this_task
-        if self.chapters_to_process_total > 0:
+        if self.chapters_to_process_total > 0: # Only update batch progress bar if it's a batch
             progress_value = int((self.chapters_processed_count / self.chapters_to_process_total) * 100)
             self.progress_bar.setValue(progress_value)
             if self.chapters_processed_count > 0:
@@ -575,7 +629,7 @@ class MainWindow(QMainWindow):
                 self.metrics_label.setText(f"{chapters_per_minute:.2f} 章/分钟 | {tokens_per_second:.2f} Token/秒")
         self.token_label.setText(f"总消耗: 输入 {self.total_tokens[0] + self.total_input_tokens_batch} | 输出 {self.total_tokens[1] + self.total_output_tokens_batch}")
 
-    def handle_chapter_error(self, identifier, error_msg):
+    def handle_chapter_error(self, identifier, error_msg): # For BATCH tasks
         if isinstance(identifier, tuple) and len(identifier) == 2:
             vol_title, chap_original_title = identifier
             item = self.find_chapter_item_by_identifier(identifier)
@@ -585,7 +639,6 @@ class MainWindow(QMainWindow):
             id_str = str(identifier)
             item = None
             if isinstance(id_str, str):
-                 # This fallback for chapter_display_title might not be perfect if identifier is not original_title
                  temp_item = self.find_chapter_item_by_identifier(("UnknownVolume", id_str))
                  if temp_item and hasattr(temp_item, 'original_title'): chapter_display_title = temp_item.original_title
                  else: chapter_display_title = id_str
@@ -600,15 +653,14 @@ class MainWindow(QMainWindow):
             status_bar_error_summary = status_bar_error_summary[:147] + "..."
 
         self.status_label.setText(f"错误: 章节 '{chapter_display_title}' - {status_bar_error_summary}")
-        # QMessageBox.warning(self, "提炼错误", f"章节 '{chapter_display_title}' 处理失败: {error_msg}") # Pop-up removed
 
-    def handle_task_finished(self, identifier):
+    def handle_task_finished(self, identifier): # For BATCH tasks
         self.active_batch_tasks -= 1
         if self.active_batch_tasks == 0:
             self.total_tokens[0] += self.total_input_tokens_batch
             self.total_tokens[1] += self.total_output_tokens_batch
             self.token_label.setText(f"Token消耗: 输入 {self.total_tokens[0]} | 输出 {self.total_tokens[1]}")
-            self.processing_finished(stopped_by_user=self.stop_batch_requested)
+            self.processing_finished(stopped_by_user=self.stop_batch_requested) # Call general batch finished
 
     def find_chapter_item_by_identifier(self, identifier):
         if not isinstance(identifier, tuple) or len(identifier) != 2:
@@ -632,7 +684,7 @@ class MainWindow(QMainWindow):
                 return None
         return None
 
-    def handle_error(self, error_msg): # For old WorkerThread
+    def handle_error(self, error_msg): # For SINGLE task (WorkerThread)
         full_error_message = f"处理错误 (单个章节): {error_msg}"
         print(f"ERROR_SINGLE_CHAPTER: {full_error_message}")
 
@@ -640,8 +692,10 @@ class MainWindow(QMainWindow):
         if len(status_bar_error_summary) > 150:
             status_bar_error_summary = status_bar_error_summary[:147] + "..."
         self.status_label.setText(f"处理错误: {status_bar_error_summary}")
-        # QMessageBox.critical(self, "处理错误", error_msg) # Pop-up removed
-        self.processing_finished()
+        # Note: processing_finished_single_task() is connected to worker_thread.finished,
+        # so it will handle UI re-enablement.
+        # If error occurs before thread starts, UI reset is in summarize_selected's except block.
+
 
     def start_batch_processing(self, total_tasks):
         print(f"DEBUG: start_batch_processing called with total_tasks: {total_tasks}")
@@ -652,7 +706,7 @@ class MainWindow(QMainWindow):
         self.total_output_tokens_batch = 0
         self.batch_start_time = time.time()
         self.average_time_per_chapter = 0
-        self.progress_bar.setMaximum(total_tasks)
+        self.progress_bar.setMaximum(total_tasks if total_tasks > 0 else 100) # Ensure max is not 0
         self.progress_bar.setValue(0)
         self.eta_label.setText("预计剩余时间: 计算中...")
         self.metrics_label.setText("速率: 计算中...")
@@ -668,7 +722,6 @@ class MainWindow(QMainWindow):
         self.save_config_btn.setEnabled(False)
         self.load_config_btn.setEnabled(False)
         self.prompt_input.setEnabled(False)
-        # self.export_btn.setEnabled(False) # Already removed
 
         if hasattr(self, 'add_model_action') and self.add_model_action:
             self.add_model_action.setEnabled(False)
@@ -680,14 +733,13 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(True)
         print("DEBUG: start_batch_processing finished UI disabling")
 
-    def update_progress(self, in_tokens, out_tokens, count): # For old WorkerThread
-        self.total_tokens[0] += in_tokens
+    def update_progress(self, in_tokens, out_tokens, count): # For SINGLE task (WorkerThread)
+        self.total_tokens[0] += in_tokens # Update global tokens
         self.total_tokens[1] += out_tokens
         self.token_label.setText(
             f"Token消耗: 输入 {self.total_tokens[0]} | 输出 {self.total_tokens[1]}"
         )
-        if self.progress_bar.maximum() == 1 or self.progress_bar.maximum() == 0 :
-             self.progress_bar.setMaximum(1)
+        if self.progress_bar.maximum() == 1: # Check if it's single task mode
              self.progress_bar.setValue(self.progress_bar.value() + count)
 
     def export_results(self):
@@ -933,14 +985,14 @@ class MainWindow(QMainWindow):
     def restore_chapter_states(self, states):
         print(f"DEBUG: Entering MainWindow.restore_chapter_states (processing {len(states)} states)")
         if self.chapter_tree.topLevelItemCount() == 0:
-            print("DEBUG: MainWindow.restore_chapter_states - Chapter tree is empty, exiting.") # Corrected from previous attempt
+            print("DEBUG: MainWindow.restore_chapter_states - Chapter tree is empty, exiting.")
             return
         book_item = self.chapter_tree.topLevelItem(0)
         if not book_item:
-            print("DEBUG: MainWindow.restore_chapter_states - Book item not found, exiting.") # Corrected from previous attempt
+            print("DEBUG: MainWindow.restore_chapter_states - Book item not found, exiting.")
             return
 
-        self.chapter_tree.setUpdatesEnabled(False) # <<< ADDED: Disable updates
+        self.chapter_tree.setUpdatesEnabled(False)
         try:
             for state_data in states:
                 if not isinstance(state_data, dict): continue
@@ -953,7 +1005,6 @@ class MainWindow(QMainWindow):
                         for j in range(vol_item.childCount()):
                             chap_item = vol_item.child(j)
                             if isinstance(chap_item, ChapterTreeItem) and chap_item.original_title == chap_title:
-                                # print(f"DEBUG: MainWindow.restore_chapter_states - restoring state for: {chap_title}") # Optional debug print
                                 chap_item.is_summarized = state_data.get("is_summarized", False)
                                 chap_item.summary = state_data.get("summary", "")
                                 chap_item.summary_timestamp = float(state_data.get("timestamp", 0))
@@ -964,37 +1015,63 @@ class MainWindow(QMainWindow):
                                 break
                         break
         finally:
-            self.chapter_tree.setUpdatesEnabled(True) # <<< ADDED: Re-enable updates
+            self.chapter_tree.setUpdatesEnabled(True)
             print("DEBUG: Exiting MainWindow.restore_chapter_states")
 
     def update_prompt(self):
         self.custom_prompt = self.prompt_input.text()
 
     def test_connection(self):
-        if not self.validate_config(): return
+        print("DEBUG: test_connection called")
+        if not self.validate_config():
+            print("DEBUG: test_connection - validate_config failed")
+            return
+
         try:
-            api_config = {"url": self.api_url_input.text().strip(), "key": self.api_key_input.text().strip(), "model": self.get_current_model_name()}
+            api_config = {
+                "url": self.api_url_input.text().strip(),
+                "key": self.api_key_input.text().strip(),
+                "model": self.get_current_model_name()
+            }
+            print(f"DEBUG: test_connection - API Config: {api_config}")
+
             encoding_object = self.get_tiktoken_encoding(api_config['model'])
+            print(f"DEBUG: test_connection - Encoding Object: {type(encoding_object)}")
+
             if encoding_object is None:
-                QMessageBox.critical(self, "错误", f"无法为模型 {api_config['model']} 初始化Token编码器。测试中止。"); return
+                QMessageBox.critical(self, "编码器错误", f"无法为模型 '{api_config.get('model','未知')}' 初始化Token编码器。测试中止。")
+                self.status_label.setText(f"错误: 模型 '{api_config.get('model','未知')}' Token编码器初始化失败。")
+                print("DEBUG: test_connection - encoding_object is None, aborting.")
+                return
+
+            print("DEBUG: test_connection - Instantiating LLMProcessor for test")
             processor = LLMProcessor(api_config, self.custom_prompt, encoding_object)
+            print("DEBUG: test_connection - LLMProcessor instantiated for test")
+
             test_text = "这是一个连接测试。"
             self.status_label.setText("正在测试连接..."); QApplication.processEvents()
+
+            print("DEBUG: test_connection - Calling processor.summarize for test")
             summary, in_tokens, out_tokens = processor.summarize(test_text, max_retries=1)
-            if summary:
+            print(f"DEBUG: test_connection - processor.summarize returned. Summary empty: {not bool(summary)}")
+
+            if summary or summary == "":
                 QMessageBox.information(self, "连接成功", f"API连接测试成功！\n模型: {api_config['model']}\n返回: {summary[:100]}...")
                 self.status_label.setText("连接测试成功")
-            else: raise ValueError("API返回内容为空")
+            else:
+                raise ValueError("API返回内容为空或无效 (None)")
+
         except Exception as e:
-            QMessageBox.critical(self, "连接失败", f"API连接测试失败:\n{str(e)}")
+            error_msg = f"API连接测试失败: {str(e)}"
+            print(f"DEBUG: test_connection - EXCEPTION: {error_msg}")
+            QMessageBox.critical(self, "连接失败", error_msg)
             self.status_label.setText("连接测试失败")
 
-    def auto_save(self):
+    def auto_save(self): # auto_save_config is the one connected to timer
         self.save_config(silent=True)
 
     def auto_export_novel_data(self):
         if not self.book_data.get("title"):
-            # print("DEBUG: Auto-export skipped - no book title (book not loaded or no title).")
             return
 
         book_title_for_folder = re.sub(r'[\/*?:"<>|]', "_", self.book_data["title"])
@@ -1005,16 +1082,9 @@ class MainWindow(QMainWindow):
 
         try:
             os.makedirs(specific_book_export_path, exist_ok=True)
-
-            # print(f"DEBUG: Auto-exporting TXT to {specific_book_export_path}")
             self.export_txt(specific_book_export_path)
-
-            # print(f"DEBUG: Auto-exporting MD to {specific_book_export_path}")
             self.export_markdown(specific_book_export_path)
-
             self.status_label.setText(f"'{book_title_for_folder}' 已自动保存到桌面。")
-            # print(f"DEBUG: Auto-export successful for '{book_title_for_folder}' to {specific_book_export_path}")
-
         except Exception as e:
             error_message = f"自动导出到桌面失败: {str(e)}"
             print(f"ERROR: Auto-export failed: {error_message}")
@@ -1022,7 +1092,7 @@ class MainWindow(QMainWindow):
 
     def save_chapter_edits(self):
         current_item = self.chapter_tree.currentItem()
-        if isinstance(current_item, ChapterTreeItem) and not self.content_display.isReadOnly(): # This implies edit mode was active
+        if isinstance(current_item, ChapterTreeItem) and not self.content_display.isReadOnly():
             new_content = self.content_display.toPlainText()
             current_item.content = new_content
             current_item.word_count = len(new_content)
@@ -1034,7 +1104,6 @@ class MainWindow(QMainWindow):
             current_item.update_display_text()
 
             self.content_display.setReadOnly(True)
-            # if hasattr(self, 'edit_chapter_btn'): self.edit_chapter_btn.setText("编辑章节")
             self.status_label.setText(f"章节 '{current_item.original_title}' 修改已保存。")
 
             print("DEBUG: Triggering auto-export from save_chapter_edits")
@@ -1042,89 +1111,59 @@ class MainWindow(QMainWindow):
         else:
             self.status_label.setText("没有可保存的章节修改或当前非编辑模式。")
 
-
     def get_tiktoken_encoding(self, model_name_from_config: str):
-        # Determine the effective model name or encoding name for tiktoken
-        # This logic is similar to what was in LLMProcessor.__init__
-        # It needs access to tiktoken module.
-        # Ensure 'import tiktoken' is at the top of main_window.py
-
         effective_encoding_key = None
         try:
-            # Try to get a specific model encoding name (e.g., "gpt-4", "gpt-3.5-turbo")
-            # This part needs careful mapping, similar to LLMProcessor's old init
-            # For simplicity, let's assume model_name_from_config can sometimes be directly used
-            # or we map it to a known tiktoken model or a base encoding like 'cl100k_base'.
-
-            # Simplified logic: try direct model name, then map, then default.
-            # This logic should mirror what LLMProcessor used to do to find an encoding.
-            # This is crucial and must be robust.
-
             _model_key_for_tiktoken = model_name_from_config.split('/')[-1].lower()
-
-            # Common mappings (can be expanded or made more sophisticated)
             encoding_map = {
-                'gpt-4': 'cl100k_base', # Often works directly with tiktoken.encoding_for_model("gpt-4")
-                'gpt-3.5-turbo': 'cl100k_base', # Also often works directly
+                'gpt-4': 'cl100k_base',
+                'gpt-3.5-turbo': 'cl100k_base',
                 'deepseek-chat': 'cl100k_base',
-                'qwen': 'cl100k_base', # For qwen-turbo, qwen-plus etc.
-                'chatglm': 'cl100k_base', # For chatglm-pro etc.
-                # Add other known prefixes if they map to specific tiktoken models or base encodings
+                'qwen': 'cl100k_base',
+                'chatglm': 'cl100k_base',
             }
-
-            # First, try the direct model key if it's specific (like "gpt-4")
             try:
                 effective_encoding_key = _model_key_for_tiktoken
-                # Check cache first with this specific key
                 with self.tiktoken_cache_lock:
                     if effective_encoding_key in self.tiktoken_encoding_cache:
                         return self.tiktoken_encoding_cache[effective_encoding_key]
-                # If not cached, try to get it
                 encoding_obj = tiktoken.encoding_for_model(effective_encoding_key)
                 with self.tiktoken_cache_lock:
                     self.tiktoken_encoding_cache[effective_encoding_key] = encoding_obj
                 print(f"DEBUG: Tiktoken encoding for '{effective_encoding_key}' (model specific) cached and returned.")
                 return encoding_obj
-            except KeyError: # Model not directly known to tiktoken.encoding_for_model
-                pass # Proceed to mapping or base encoding
+            except KeyError:
+                pass
 
-            # Try mapping known prefixes
             for prefix, base_encoding_name in encoding_map.items():
                 if _model_key_for_tiktoken.startswith(prefix):
                     effective_encoding_key = base_encoding_name
                     break
 
-            if not effective_encoding_key: # Default if no specific model or prefix match
+            if not effective_encoding_key:
                 effective_encoding_key = 'cl100k_base'
 
-            # Check cache for the determined effective_encoding_key (e.g., 'cl100k_base')
             with self.tiktoken_cache_lock:
                 if effective_encoding_key in self.tiktoken_encoding_cache:
                     return self.tiktoken_encoding_cache[effective_encoding_key]
 
-            # If not in cache, create, cache, and return
             print(f"DEBUG: Initializing tiktoken encoding for: '{effective_encoding_key}' (derived from '{model_name_from_config}')")
             encoding_obj = tiktoken.get_encoding(effective_encoding_key)
             with self.tiktoken_cache_lock:
                 self.tiktoken_encoding_cache[effective_encoding_key] = encoding_obj
             print(f"DEBUG: Tiktoken encoding for '{effective_encoding_key}' cached and returned.")
             return encoding_obj
-
         except Exception as e:
             print(f"ERROR: Failed to get/create tiktoken encoding for '{model_name_from_config}'. Error: {e}. Using default 'cl100k_base'.")
-            # Fallback to a default if everything else fails
-            with self.tiktoken_cache_lock: # Protect cache access even in fallback
+            with self.tiktoken_cache_lock:
                 if 'cl100k_base' in self.tiktoken_encoding_cache:
                     return self.tiktoken_encoding_cache['cl100k_base']
                 try:
                     encoding_obj = tiktoken.get_encoding('cl100k_base')
                     self.tiktoken_encoding_cache['cl100k_base'] = encoding_obj
                     return encoding_obj
-                except Exception as e_default: # Should not happen if tiktoken is installed
+                except Exception as e_default:
                      print(f"CRITICAL ERROR: Failed to get default tiktoken encoder 'cl100k_base': {e_default}")
-                     # This is a critical failure. Application might not function correctly for token counts.
-                     # Raising an error or returning None might be options.
-                     # For now, returning None and LLMProcessor should handle it.
                      return None
 
     def closeEvent(self, event):
@@ -1143,7 +1182,6 @@ class MainWindow(QMainWindow):
         except Exception as e: print(f"Error saving config on close: {e}")
         event.accept()
 
-
 if __name__ == "__main__":
     import sys
 
@@ -1155,5 +1193,3 @@ if __name__ == "__main__":
     window.show()
 
     sys.exit(app.exec_())
-
-[end of main_window.py]
