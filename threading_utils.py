@@ -14,9 +14,9 @@ class SummarizationSignals(QObject):
     finished_signal = pyqtSignal(object) # identifier
 
 class SummarizationTask(QRunnable):
-    def __init__(self, chapter_item_identifier, chapter_content, chapter_context, api_config, custom_prompt_text, main_window_ref):
+    def __init__(self, chapter_item_identifier, chapter_content, chapter_context, api_config, custom_prompt_text, main_window_ref, encoding_object): # Added encoding_object
         super().__init__()
-        print(f"DEBUG: SummarizationTask.__init__ for identifier: {chapter_item_identifier}") # <<< ADD
+        # print(f"DEBUG: SummarizationTask.__init__ for identifier: {chapter_item_identifier}") # Ignored existing debug print
         self.identifier = chapter_item_identifier
         self.content = chapter_content
         self.context = chapter_context
@@ -24,13 +24,14 @@ class SummarizationTask(QRunnable):
         self.custom_prompt_for_processor = custom_prompt_text
         self.signals = SummarizationSignals()
         self.main_window = main_window_ref # Store reference to MainWindow
+        self.encoding_object = encoding_object # Store encoding_object
 
         # This import needs to be here if llm_processor.py is a separate file
         from llm_processor import LLMProcessor
 
 
     def run(self):
-        print(f"DEBUG: SummarizationTask.run for identifier: {self.identifier} - Thread ID: {threading.get_ident()}") # <<< ADD
+        # print(f"DEBUG: SummarizationTask.run for identifier: {self.identifier} - Thread ID: {threading.get_ident()}") # Ignored existing debug print
         # Check stop flag before doing significant work
         if self.main_window.stop_batch_requested:
             self.signals.error_signal.emit(self.identifier, "处理被用户中止")
@@ -38,9 +39,9 @@ class SummarizationTask(QRunnable):
             return
 
         # LLMProcessor is instantiated here, specific to this task
-        print(f"DEBUG: SummarizationTask.run - Instantiating LLMProcessor for: {self.identifier}") # <<< ADD
-        processor = LLMProcessor(self.api_config, self.custom_prompt_for_processor)
-        print(f"DEBUG: SummarizationTask.run - LLMProcessor instantiated for: {self.identifier}") # <<< ADD
+        # print(f"DEBUG: SummarizationTask.run - Instantiating LLMProcessor for: {self.identifier}") # Ignored existing debug print
+        processor = LLMProcessor(self.api_config, self.custom_prompt_for_processor, self.encoding_object) # Pass encoding_object
+        # print(f"DEBUG: SummarizationTask.run - LLMProcessor instantiated for: {self.identifier}") # Ignored existing debug print
         summary_text = None # Ensure it's defined for the finally block
         try:
             # Another check before the actual API call
