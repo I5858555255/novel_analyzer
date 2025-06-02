@@ -2,7 +2,7 @@
 import os
 import re
 import json
-import threading
+import threading # Ensure threading is imported
 import queue
 import time
 import copy
@@ -66,16 +66,19 @@ class MainWindow(QMainWindow):
         self.pending_batch_tasks_data = []
         self.current_batch_chunk_offset = 0
 
+        self.batch_content_store = {} # Added for on-demand content fetching
+        self.content_store_lock = threading.Lock() # Added
+
         self._is_ui_ready = False
         self.auto_export_base_dir = os.path.join(os.path.expanduser("~"), "Desktop", "NovelAnalyzer_Exports")
 
-        self.init_ui() # batch_size_spinbox is created here
+        self.init_ui()
         self._is_ui_ready = True
 
         self.auto_save_timer = QTimer()
         self.auto_save_timer.timeout.connect(lambda: self.save_config(silent=True))
         self.auto_save_timer.start(30000)
-        self.load_config(silent=True) # batch_size_spinbox value is loaded here
+        self.load_config(silent=True)
 
     def init_ui(self):
         main_widget = QWidget()
@@ -84,7 +87,7 @@ class MainWindow(QMainWindow):
         control_layout = QHBoxLayout()
         self.model_combo = QComboBox()
         self.model_combo.setEditable(True)
-        for model_key, config_item in self.model_configs.items(): # Renamed config to config_item to avoid conflict
+        for model_key, config_item in self.model_configs.items():
             self.model_combo.addItem(config_item["display_name"], model_key)
         self.model_combo.setCurrentIndex(-1)
         self.model_combo.setPlaceholderText("选择或输入模型名称")
@@ -155,7 +158,7 @@ class MainWindow(QMainWindow):
         self.batch_size_spinbox = QSpinBox()
         self.batch_size_spinbox.setMinimum(1)
         self.batch_size_spinbox.setMaximum(100)
-        self.batch_size_spinbox.setValue(10) # Default value, will be overridden by load_config if available
+        self.batch_size_spinbox.setValue(10)
         self.batch_size_spinbox.setSingleStep(1)
         self.batch_size_spinbox.setToolTip("设置“一键提炼”时每批处理的章节数量 (1-100)")
         btn_layout.addWidget(self.batch_size_spinbox)
@@ -213,7 +216,7 @@ class MainWindow(QMainWindow):
             current_text = self.model_combo.currentText()
             current_data = self.model_combo.currentData()
             if current_data and current_data in self.model_configs:
-                config_data = self.model_configs[current_data] # Renamed to avoid conflict
+                config_data = self.model_configs[current_data]
                 self.api_url_input.setText(config_data["url"])
             elif current_text and current_text not in [self.model_combo.itemText(i) for i in range(self.model_combo.count())]:
                 pass
@@ -409,7 +412,7 @@ class MainWindow(QMainWindow):
             self.summarize_btn.setEnabled(False)
             self.summarize_all_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
-            self.batch_size_spinbox.setEnabled(False) # Disable during single task too
+            self.batch_size_spinbox.setEnabled(False)
             self.status_label.setText(f"正在处理章节: {current.original_title}...")
 
             print(f"DEBUG: summarize_selected - Starting WorkerThread for chapter: {current.original_title}")
@@ -426,6 +429,23 @@ class MainWindow(QMainWindow):
             self.summarize_all_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
             self.batch_size_spinbox.setEnabled(True)
+
+    def prepare_content_store(self, all_task_structs):
+        print(f"DEBUG: MainWindow.prepare_content_store - Preparing content for {len(all_task_structs)} tasks.")
+        with self.content_store_lock:
+            self.batch_content_store.clear()
+            for task_data in all_task_structs:
+                self.batch_content_store[task_data["identifier"]] = task_data["content"]
+        print(f"DEBUG: MainWindow.prepare_content_store - Content store populated with {len(self.batch_content_store)} items.")
+
+    def get_content_for_task(self, identifier):
+        with self.content_store_lock:
+            content = self.batch_content_store.get(identifier)
+        return content
+
+    def clear_content_for_task(self, identifier):
+        with self.content_store_lock:
+            self.batch_content_store.pop(identifier, None)
 
     def summarize_all(self):
         print("DEBUG: summarize_all called")
@@ -461,7 +481,13 @@ class MainWindow(QMainWindow):
             print("DEBUG: summarize_all returned - no tasks to run")
             return
 
-        self.pending_batch_tasks_data = all_tasks_data_list
+        self.prepare_content_store(all_tasks_data_list) # Populate content store
+
+        # self.pending_batch_tasks_data will now store dicts without 'content'
+        # as content is fetched on demand by SummarizationTask
+        self.pending_batch_tasks_data = [
+            {"identifier": td["identifier"], "context": td["context"]} for td in all_tasks_data_list
+        ]
         self.current_batch_chunk_offset = 0
 
         self.start_batch_processing(len(self.pending_batch_tasks_data))
@@ -509,14 +535,14 @@ class MainWindow(QMainWindow):
             self.processing_finished(stopped_by_user=True)
             return
 
-        for task_data in current_chunk_tasks_data:
+        for task_data in current_chunk_tasks_data: # task_data here does not have 'content'
             if self.stop_batch_requested:
                 print(f"DEBUG: process_next_batch_chunk - Stop requested, breaking task creation for current chunk.")
                 break
 
             runnable_task = SummarizationTask(
                 chapter_item_identifier=task_data["identifier"],
-                chapter_content=task_data["content"],
+                # chapter_content is no longer passed here
                 chapter_context=task_data["context"],
                 api_config=api_config,
                 custom_prompt_text=self.custom_prompt,
@@ -527,8 +553,9 @@ class MainWindow(QMainWindow):
             runnable_task.signals.progress_signal.connect(self.update_batch_progress)
             runnable_task.signals.error_signal.connect(self.handle_chapter_error)
             runnable_task.signals.finished_signal.connect(self.handle_task_finished)
+            print(f"DEBUG: MainWindow.process_next_batch_chunk - About to start task in thread_pool for: {task_data['identifier']}")
             self.thread_pool.start(runnable_task)
-            print(f"DEBUG: process_next_batch_chunk - Task submitted for: {task_data['identifier']}")
+            print(f"DEBUG: MainWindow.process_next_batch_chunk - Task for {task_data['identifier']} SUBMITTED to thread_pool.")
 
         self.current_batch_chunk_offset = end_index
         print(f"DEBUG: process_next_batch_chunk - Next offset: {self.current_batch_chunk_offset}")
@@ -566,6 +593,11 @@ class MainWindow(QMainWindow):
 
     def processing_finished(self, stopped_by_user=False):
         print(f"DEBUG: processing_finished (batch) called. Stopped by user: {stopped_by_user}")
+
+        with self.content_store_lock: # Clear content store on batch finish/stop
+            self.batch_content_store.clear()
+        print("DEBUG: MainWindow.processing_finished - Batch content store cleared.")
+
         self.summarize_btn.setEnabled(True)
         self.summarize_all_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
@@ -937,7 +969,7 @@ class MainWindow(QMainWindow):
             "custom_models": {k: v for k, v in self.model_configs.items() if k not in self.initial_model_keys},
             "book_data": self.book_data, "summary_mode": self.summary_mode_btn.isChecked(),
             "custom_prompt": self.custom_prompt, "chapter_states": self.get_chapter_states(),
-            "batch_size": self.batch_size_spinbox.value() # Save batch size
+            "batch_size": self.batch_size_spinbox.value()
         }
         try:
             with open("config.json", 'w', encoding='utf-8') as f: json.dump(config, f, ensure_ascii=False, indent=2)
@@ -975,10 +1007,10 @@ class MainWindow(QMainWindow):
             self.batch_size_spinbox.setValue(default_batch_size)
             return
         try:
-            with open(config_path, 'r', encoding='utf-8') as f: config_data = json.load(f) # Renamed to config_data
+            with open(config_path, 'r', encoding='utf-8') as f: config_data = json.load(f)
 
             if "custom_models" in config_data:
-                for model_key, model_data_val in config_data["custom_models"].items(): # Renamed model_data to model_data_val
+                for model_key, model_data_val in config_data["custom_models"].items():
                     if model_key not in self.initial_model_keys:
                          self.model_configs[model_key] = model_data_val
                          if self.model_combo.findData(model_key) == -1:
@@ -997,9 +1029,9 @@ class MainWindow(QMainWindow):
             self.custom_prompt = config_data.get("custom_prompt", DEFAULT_CUSTOM_PROMPT)
             self.prompt_input.setText(self.custom_prompt)
 
-            loaded_batch_size_val = config_data.get("batch_size", default_batch_size) # Renamed
+            loaded_batch_size_val = config_data.get("batch_size", default_batch_size)
             try:
-                loaded_batch_size_int = int(loaded_batch_size_val) # Renamed
+                loaded_batch_size_int = int(loaded_batch_size_val)
                 if not (self.batch_size_spinbox.minimum() <= loaded_batch_size_int <= self.batch_size_spinbox.maximum()):
                     loaded_batch_size_int = default_batch_size
                     print(f"Warning: Loaded batch_size '{config_data.get('batch_size')}' out of range, reset to {loaded_batch_size_int}.")
@@ -1257,7 +1289,7 @@ class MainWindow(QMainWindow):
             else:
                 event.ignore()
                 return
-        try: self.save_config(silent=True) # Ensure config is saved on normal close
+        try: self.save_config(silent=True)
         except Exception as e: print(f"Error saving config on close: {e}")
         event.accept()
 
