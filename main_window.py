@@ -1291,6 +1291,7 @@ class MainWindow(QMainWindow):
                     except Exception as e_default:
                         print(f"CRITICAL ERROR: Failed to get default tiktoken encoder 'cl100k_base': {e_default}")
                         return None
+    # End of get_tiktoken_encoding method.
 
     def closeEvent(self, event):
         if self.worker_thread and self.worker_thread.isRunning():
