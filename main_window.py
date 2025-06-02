@@ -1304,8 +1304,13 @@ class MainWindow(QMainWindow):
             else:
                 event.ignore()
                 return
-        try: self.save_config(silent=True)
-        except Exception as e: print(f"Error saving config on close: {e}")
+        # This code path is for when the `if self.worker_thread and self.worker_thread.isRunning():` is false initially,
+        # or when the user chose 'Yes' to exit, the worker thread was stopped, and config was saved (though that path also calls event.accept() and returns).
+        # The primary purpose here is to save config if no worker was running.
+        try:
+            self.save_config(silent=True)
+        except Exception as e:
+            print(f"Error saving config on close: {e}")
         event.accept()
 
 if __name__ == "__main__":
