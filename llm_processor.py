@@ -70,9 +70,16 @@ class LLMProcessor:
         try:
             return len(self.encoding.encode(text))
         except Exception as e:
-            print(f"Error in calculate_tokens with tiktoken: {e}. Using rough estimate.")
+            # Log the error and a sample of the problematic text
+            error_message = f"Error during tiktoken.encode: {str(e)}. "
+            error_message += f"Problematic text (first 100 chars): '{text[:100]}'. "
+            error_message += "Falling back to rough token estimation."
+            print(error_message)
+
+            # Fallback logic
             chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
             other_chars = len(text) - chinese_chars
+            # The current formula (chinese_chars / 1.5 + other_chars / 4) seems okay.
             return int(chinese_chars / 1.5 + other_chars / 4)
 
     def summarize(self, text, context="", max_retries=None):

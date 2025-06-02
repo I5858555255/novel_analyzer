@@ -779,7 +779,10 @@ class MainWindow(QMainWindow):
                        hasattr(chap_item, 'original_title') and \
                        chap_item.original_title == target_chap_original_title:
                         return chapter_item
+                # If the volume was found, but the chapter was not, return None.
+                # This means the inner loop completed without returning a chapter_item.
                 return None
+        # If the volume itself was not found after checking all volumes, return None.
         return None
 
     def handle_error(self, error_msg):
@@ -1234,48 +1237,60 @@ class MainWindow(QMainWindow):
                 'chatglm': 'cl100k_base',
             }
             try:
+                # Attempt 1: Try direct model name (which might be a specific version like gpt-4-0613)
                 effective_encoding_key = _model_key_for_tiktoken
                 with self.tiktoken_cache_lock:
                     if effective_encoding_key in self.tiktoken_encoding_cache:
                         return self.tiktoken_encoding_cache[effective_encoding_key]
-                encoding_obj = tiktoken.encoding_for_model(effective_encoding_key)
+                    try:
+                        # Try encoding_for_model first
+                        encoding_obj = tiktoken.encoding_for_model(effective_encoding_key)
+                        self.tiktoken_encoding_cache[effective_encoding_key] = encoding_obj
+                        print(f"DEBUG: Tiktoken encoding for '{effective_encoding_key}' (model specific) cached and returned.")
+                        return encoding_obj
+                    except KeyError:
+                        # This specific model name is not directly known by tiktoken.encoding_for_model
+                        # Proceed to mapped/generic logic below.
+                        pass # Fall through to the next mechanism (mapped or generic cl100k_base)
+
+                # Attempt 2: Check mapped prefixes if direct model name failed
+                # This section is reached if encoding_for_model raised KeyError
+                derived_encoding_key = None
+                for prefix, base_encoding_name in encoding_map.items():
+                    if _model_key_for_tiktoken.startswith(prefix):
+                        derived_encoding_key = base_encoding_name
+                        break
+
+                if not derived_encoding_key: # If no prefix matched, default to cl100k_base
+                    derived_encoding_key = 'cl100k_base'
+
+                effective_encoding_key = derived_encoding_key # Use the derived key for caching
+
                 with self.tiktoken_cache_lock:
+                    if effective_encoding_key in self.tiktoken_encoding_cache:
+                        return self.tiktoken_encoding_cache[effective_encoding_key]
+
+                    # If not in cache, create using get_encoding and store it
+                    print(f"DEBUG: Initializing tiktoken encoding for: '{effective_encoding_key}' (derived/default for '{model_name_from_config}')")
+                    encoding_obj = tiktoken.get_encoding(effective_encoding_key)
                     self.tiktoken_encoding_cache[effective_encoding_key] = encoding_obj
-                print(f"DEBUG: Tiktoken encoding for '{effective_encoding_key}' (model specific) cached and returned.")
-                return encoding_obj
-            except KeyError:
-                pass
-
-            for prefix, base_encoding_name in encoding_map.items():
-                if _model_key_for_tiktoken.startswith(prefix):
-                    effective_encoding_key = base_encoding_name
-                    break
-
-            if not effective_encoding_key:
-                effective_encoding_key = 'cl100k_base'
-
-            with self.tiktoken_cache_lock:
-                if effective_encoding_key in self.tiktoken_encoding_cache:
-                    return self.tiktoken_encoding_cache[effective_encoding_key]
-
-            print(f"DEBUG: Initializing tiktoken encoding for: '{effective_encoding_key}' (derived from '{model_name_from_config}')")
-            encoding_obj = tiktoken.get_encoding(effective_encoding_key)
-            with self.tiktoken_cache_lock:
-                self.tiktoken_encoding_cache[effective_encoding_key] = encoding_obj
-            print(f"DEBUG: Tiktoken encoding for '{effective_encoding_key}' cached and returned.")
-            return encoding_obj
-        except Exception as e:
-            print(f"ERROR: Failed to get/create tiktoken encoding for '{model_name_from_config}'. Error: {e}. Using default 'cl100k_base'.")
-            with self.tiktoken_cache_lock:
-                if 'cl100k_base' in self.tiktoken_encoding_cache:
-                    return self.tiktoken_encoding_cache['cl100k_base']
-                try:
-                    encoding_obj = tiktoken.get_encoding('cl100k_base')
-                    self.tiktoken_encoding_cache['cl100k_base'] = encoding_obj
+                    print(f"DEBUG: Tiktoken encoding for '{effective_encoding_key}' cached and returned.")
                     return encoding_obj
-                except Exception as e_default:
-                     print(f"CRITICAL ERROR: Failed to get default tiktoken encoder 'cl100k_base': {e_default}")
-                     return None
+
+            except Exception as e: # Broad exception for any failure in the above logic
+                print(f"ERROR: Failed to get/create tiktoken encoding for '{model_name_from_config}'. Error: {e}. Using fallback 'cl100k_base'.")
+                with self.tiktoken_cache_lock:
+                    if 'cl100k_base' in self.tiktoken_encoding_cache:
+                        return self.tiktoken_encoding_cache['cl100k_base']
+                    try:
+                        # Create, store, and return the default 'cl100k_base' encoder
+                        encoding_obj = tiktoken.get_encoding('cl100k_base')
+                        self.tiktoken_encoding_cache['cl100k_base'] = encoding_obj
+                        print("DEBUG: Tiktoken encoding for 'cl100k_base' (fallback) cached and returned.")
+                        return encoding_obj
+                    except Exception as e_default:
+                        print(f"CRITICAL ERROR: Failed to get default tiktoken encoder 'cl100k_base': {e_default}")
+                        return None
 
     def closeEvent(self, event):
         if self.worker_thread and self.worker_thread.isRunning():
