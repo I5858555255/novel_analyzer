@@ -1294,24 +1294,30 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         if self.worker_thread and self.worker_thread.isRunning():
-            reply = QMessageBox.question(self, '确认退出', '正在处理任务，确定要退出吗？', QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            reply = QMessageBox.question(self, '确认退出', '正在处理任务，确定要退出吗？',
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if reply == QMessageBox.Yes:
                 self.worker_thread.stop()
-                self.worker_thread.wait(3000)
-                try: self.save_config(silent=True)
-                except Exception as e: print(f"Error saving config during forced close: {e}")
+                self.worker_thread.wait(3000) # Wait for thread to finish
+                try:
+                    self.save_config(silent=True)
+                except Exception as e:
+                    print(f"Error saving config during forced close: {e}")
                 event.accept()
+                return # Event handled, exit method
             else:
                 event.ignore()
-                return
-        # This code path is for when the `if self.worker_thread and self.worker_thread.isRunning():` is false initially,
-        # or when the user chose 'Yes' to exit, the worker thread was stopped, and config was saved (though that path also calls event.accept() and returns).
-        # The primary purpose here is to save config if no worker was running.
+                return # Event handled (ignored), exit method
+
+        # This block is executed if the worker_thread is not running
+        # or if the user chose 'No' in the dialog (but that case returns).
+        # Effectively, this is for the case where no worker thread was running.
         try:
             self.save_config(silent=True)
         except Exception as e:
             print(f"Error saving config on close: {e}")
-        event.accept()
+
+        event.accept() # Accept the event if not handled and returned above
 
 if __name__ == "__main__":
     import sys
