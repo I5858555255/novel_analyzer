@@ -1,0 +1,12 @@
+PyQt5
+requests
+tiktoken
+diskcache
+jieba
+spacy
+matplotlib
+pyqtgraph
+llama-index
+chromadb
+huggingface-hub
+PyQt5

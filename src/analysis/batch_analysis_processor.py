@@ -1,8 +1,8 @@
 import time
 from PyQt5.QtCore import QObject, QRunnable, pyqtSignal, QTimer
-from llm_processor import LLMProcessor
-from llm_requirements_data import REQUIREMENTS_STRUCTURE
-from custom_widgets import ChapterTreeItem
+from core.llm_processor import LLMProcessor
+from analysis.llm_requirements_data import REQUIREMENTS_STRUCTURE
+from gui.custom_widgets import ChapterTreeItem
 from PyQt5.QtWidgets import QApplication
 
 

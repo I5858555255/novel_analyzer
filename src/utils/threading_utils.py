@@ -10,7 +10,7 @@ import queue  # For queue.Empty in WorkerThread
 import time
 import threading
 
-from llm_processor import LLMProcessor
+from core.llm_processor import LLMProcessor
 # MainWindow is not directly imported, but passed as main_window_ref to SummarizationTask.
 
 
