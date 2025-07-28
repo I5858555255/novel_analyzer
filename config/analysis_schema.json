@@ -1,0 +1,18 @@
+{
+    "analysis_items": [
+        {
+            "id": "AG_1",
+            "name": "核心原则",
+            "prompt_template": "...",
+            "type": "prompt_only",
+            "enabled": true
+        },
+        {
+            "id": "AG_2_1_1",
+            "name": "物理/魔法规则",
+            "prompt_template": "...",
+            "type": "aggregate",
+            "enabled": true
+        }
+    ]
+}

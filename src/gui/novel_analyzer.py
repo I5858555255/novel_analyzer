@@ -34,17 +34,17 @@ from PyQt5.QtCore import (
 # Import constants
 from constants import DEFAULT_MODEL_CONFIGS
 # Import PerformanceLogger
-from performance_logger import PerformanceLogger
+from utils.performance_logger import PerformanceLogger
 # Import ChapterTreeItem
-from custom_widgets import ChapterTreeItem
+from gui.custom_widgets import ChapterTreeItem
 # Import LLMProcessor
-from llm_processor import LLMProcessor
+from core.llm_processor import LLMProcessor
 # Import Dialogs
-from dialogs import ManageModelsDialog, LogViewerDialog # Added LogViewerDialog
+from gui.dialogs import ManageModelsDialog, LogViewerDialog # Added LogViewerDialog
 
 # New Imports
-from batch_analysis_processor import BatchAnalysisProcessor # This should provide AutoFindTask and Signals
-from llm_requirements_data import REQUIREMENTS_STRUCTURE
+from analysis.batch_analysis_processor import BatchAnalysisProcessor # This should provide AutoFindTask and Signals
+from analysis.llm_requirements_data import REQUIREMENTS_STRUCTURE
 
 
 # Logging Service Implementation
@@ -2002,10 +2002,3 @@ class MainWindow(QMainWindow):
             # print(f"Error saving config on close: {e}") # Replaced by logging
         event.accept()
 
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    app.setApplicationName("小说智能分析工具")
-    app.setApplicationVersion("2.3")
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec_())

@@ -10,7 +10,7 @@ import requests
 import time
 import re
 import tiktoken  # For token calculation fallbacks
-from performance_logger import PerformanceLogger
+from utils.performance_logger import PerformanceLogger
 import hashlib # For cache key
 import json    # For cache key
 import os      # For cache directory path
